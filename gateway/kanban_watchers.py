@@ -62,11 +62,21 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
 
     Only one gateway process machine-wide may run the embedded kanban
     dispatcher: concurrent dispatchers double the reclaim frequency (each
-    runs its own ``release_stale_claims`` → promote → dispatch loop), double
-    claim-attempt events in the event log, and — with ``wal_autocheckpoint=0`` —
-    concurrent manual WAL checkpoints can corrupt index pages. The
-    ``dispatch_in_gateway`` config flag is the primary control; this lock is the
-    backstop that survives config drift and same-profile restart races.
+    runs its own ``release_stale_claims`` → promote → dispatch loop) and
+    double claim-attempt events in the event log. The ``dispatch_in_gateway``
+    config flag is the primary control; this lock is the backstop that
+    survives config drift and same-profile restart races.
+
+    The residual risk is BEHAVIOURAL, not corruptive. This docstring used to
+    claim that ``wal_autocheckpoint=0`` let concurrent manual WAL checkpoints
+    corrupt index pages; that rationale is stale on two counts (verified
+    2026-07-24): ``kanban_db.py`` sets ``PRAGMA wal_autocheckpoint=100`` on
+    every connection, and the only manual ``wal_checkpoint`` in the engine
+    (``hermes_cli/doctor.py``) targets ``state.db``, never ``kanban.db``.
+    Concurrent WRITERS are independently serialised one layer down by
+    :func:`hermes_cli.kanban_db._dispatch_tick_lock`, which every dispatch tick
+    takes — see ``tests/hermes_cli/test_kanban_dispatch_lock.py`` for the
+    evidence that two dispatchers cannot corrupt each other.
 
     Delegates to :func:`gateway.status._try_acquire_file_lock` (``fcntl`` on
     POSIX, ``msvcrt`` on Windows) so the guard is cross-platform.
@@ -794,10 +804,11 @@ class GatewayKanbanWatchersMixin:
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
         # new profile gateway (or a same-profile restart race) can silently
         # start a second dispatcher; concurrent dispatchers double reclaim
-        # frequency, double claim-attempt events, and — with
-        # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
-        # index pages. The lock lives at the machine-global kanban root
-        # (shared across profiles by design), so it serialises ALL gateways.
+        # frequency and double claim-attempt events. That cost is behavioural,
+        # not corruptive — see _acquire_singleton_lock's docstring for why the
+        # old wal_autocheckpoint=0 corruption rationale was stale. The lock
+        # lives at the machine-global kanban root (shared across profiles by
+        # design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
