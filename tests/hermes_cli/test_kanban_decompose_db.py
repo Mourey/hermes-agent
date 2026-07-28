@@ -21,6 +21,91 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture
+def worktree_lane(kanban_home):
+    """Install a fake profile whose manifest declares workspace_requires.
+
+    The lane→workspace policy reads the requirement from the profile's
+    distribution.yaml, so a test that wants the policy to fire has to put one
+    on disk under the (tmp) profiles root. Returns the lane name.
+
+    Clears the lru_cache on both sides of the test: the resolver memoizes per
+    assignee, and a cached "no requirement" from an earlier test would silently
+    disable the policy here (and vice versa).
+    """
+    kb._lane_workspace_requirement.cache_clear()
+    lane_dir = kanban_home / "profiles" / "heavy-lane"
+    lane_dir.mkdir(parents=True)
+    (lane_dir / "distribution.yaml").write_text(
+        "name: heavy-lane\nversion: 0.1.0\nworkspace_requires: worktree\n",
+        encoding="utf-8",
+    )
+    yield "heavy-lane"
+    kb._lane_workspace_requirement.cache_clear()
+
+
+def test_decompose_child_on_code_lane_does_not_inherit_scratch(
+    kanban_home, worktree_lane
+):
+    """A child routed to a worktree-requiring lane must not be born scratch.
+
+    THE regression test for the 2026-07-28 blocked-card cascade: the decomposer
+    picks a lane per child but inherited the triage root's scratch kind AND its
+    path, so every code-lane child was born into a workspace its own lane
+    refuses at spawn — and four siblings shared one directory.
+    """
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="root")          # scratch by default
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "impl", "assignee": worktree_lane},
+                {"title": "docs", "assignee": worktree_lane},
+            ],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        kids = [kb.get_task(conn, c) for c in child_ids]
+    for t in kids:
+        assert t.workspace_kind == "worktree"   # was 'scratch'
+        assert t.workspace_path is None         # was the root's shared dir
+    # Siblings must not collide: the path is derived per card at dispatch.
+    assert len({t.id for t in kids}) == 2
+
+
+def test_decompose_child_on_exempt_lane_stays_scratch(kanban_home):
+    """A lane that declares nothing keeps the inherited scratch (builder)."""
+    kb._lane_workspace_requirement.cache_clear()
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="root")
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "ops", "assignee": "cheap-ops"}],
+            author="decomposer",
+        )
+        t = kb.get_task(conn, child_ids[0])
+    assert t.workspace_kind == "scratch"
+    kb._lane_workspace_requirement.cache_clear()
+
+
+def test_decompose_explicit_child_workspace_beats_lane_policy(
+    kanban_home, worktree_lane
+):
+    """Explicit per-child intent still wins over the lane policy."""
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="root")
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "pinned", "assignee": worktree_lane,
+                       "workspace_kind": "dir",
+                       "workspace_path": "/other/repo"}],
+            author="decomposer",
+        )
+        t = kb.get_task(conn, child_ids[0])
+    assert t.workspace_kind == "dir"
+    assert t.workspace_path == "/other/repo"
+
+
 def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
     return kb.create_task(
         conn,

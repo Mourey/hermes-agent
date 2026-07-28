@@ -86,8 +86,9 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2384,6 +2385,57 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@lru_cache(maxsize=64)
+def _lane_workspace_requirement(assignee: str) -> Optional[str]:
+    """The workspace kind *assignee*'s lane requires, or None.
+
+    Read from the profile's ``distribution.yaml`` (``workspace_requires``) so
+    the requirement lives next to the lane that enforces it, rather than being
+    a second copy of the rule inside the kanban layer.
+
+    FAIL-SOFT BY DESIGN: any problem — no profile dir, no manifest, unreadable
+    or invalid YAML — returns None, i.e. "no requirement". Task creation must
+    never fail because a profile is missing; the lane's own spawn-time guard
+    remains the backstop.
+    """
+    try:
+        from hermes_cli.profile_distribution import read_manifest
+        from hermes_cli.profiles import get_profile_dir
+
+        manifest = read_manifest(get_profile_dir(assignee))
+    except Exception:
+        return None
+    if manifest is None:
+        return None
+    return manifest.workspace_requires or None
+
+
+def _apply_lane_workspace_policy(
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    """Upgrade a defaulted scratch workspace to what the assignee's lane needs.
+
+    Without this, every code-lane card is born ``scratch`` (the column default)
+    and its own lane must refuse it at spawn — the card blocks, and no backstop
+    can repair it because a scratch path encodes no repo anchor to cut a
+    worktree from.
+
+    Only ever upgrades an unqualified ``scratch``: an explicit ``--workspace``
+    (or a project link, which runs first) is intent and always wins. The
+    returned path is deliberately ``None`` so dispatch derives a FRESH
+    ``<repo>/.worktrees/<task-id>`` per card — inheriting a path here is what
+    let four sibling cards share one directory.
+    """
+    if workspace_kind != "scratch" or not assignee:
+        return workspace_kind, workspace_path
+    required = _lane_workspace_requirement(assignee)
+    if not required or required == "scratch":
+        return workspace_kind, workspace_path
+    return required, None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2489,6 +2541,15 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    # Lane policy runs AFTER the project block so an explicit project link (and
+    # any explicit --workspace) still wins; it only ever upgrades a defaulted
+    # scratch. Without it a code-lane card is born scratch and its own lane
+    # refuses it at spawn — a block no backstop can repair, because a scratch
+    # path carries no repo anchor to cut a worktree from.
+    workspace_kind, workspace_path = _apply_lane_workspace_policy(
+        assignee, workspace_kind, workspace_path
+    )
 
     parents = tuple(p for p in parents if p)
 
@@ -5446,6 +5507,17 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Lane policy, per child, using THAT child's routed assignee. The
+            # decomposer picks a lane per child but inherits the root's kind,
+            # so a triage root (scratch by default) mints code-lane children
+            # that are born scratch and block at spawn — the live failure mode
+            # this rule closes. Applied after the inheritance above so an
+            # explicit per-child override still wins, and it forces the path
+            # back to None: inheriting the root's path is what left four
+            # sibling cards pointing at one directory.
+            child_ws_kind, child_ws_path = _apply_lane_workspace_policy(
+                assignee, child_ws_kind, child_ws_path
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "

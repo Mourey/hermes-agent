@@ -222,6 +222,53 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_honors_lane_workspace_requirement(kanban_home):
+    """A lane declaring workspace_requires must not get the scratch default.
+
+    Mirror of the decompose-side regression test. Both insert sites need the
+    policy: the decomposer is the live offender, but its roots come from
+    ``create_task`` and are themselves scratch, so fixing only one leaves the
+    other minting cards their own lane will refuse at spawn.
+    """
+    kb._lane_workspace_requirement.cache_clear()
+    lane = kanban_home / "profiles" / "heavy-lane"
+    lane.mkdir(parents=True)
+    (lane / "distribution.yaml").write_text(
+        "name: heavy-lane\nversion: 0.1.0\nworkspace_requires: worktree\n",
+        encoding="utf-8",
+    )
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="build", assignee="heavy-lane")
+            t = kb.get_task(conn, tid)
+        assert t.workspace_kind == "worktree"   # was 'scratch'
+        assert t.workspace_path is None         # dispatch derives it per card
+
+        # An explicit workspace is intent and still wins.
+        with kb.connect() as conn:
+            tid2 = kb.create_task(
+                conn, title="pinned", assignee="heavy-lane",
+                workspace_kind="dir", workspace_path="/somewhere",
+            )
+            t2 = kb.get_task(conn, tid2)
+        assert t2.workspace_kind == "dir"
+        assert t2.workspace_path == "/somewhere"
+    finally:
+        kb._lane_workspace_requirement.cache_clear()
+
+
+def test_create_task_unknown_assignee_stays_scratch(kanban_home):
+    """No profile / no manifest => no requirement. Must never raise."""
+    kb._lane_workspace_requirement.cache_clear()
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="ops", assignee="nonexistent-lane")
+            t = kb.get_task(conn, tid)
+        assert t.workspace_kind == "scratch"
+    finally:
+        kb._lane_workspace_requirement.cache_clear()
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

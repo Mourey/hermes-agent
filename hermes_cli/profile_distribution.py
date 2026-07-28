@@ -47,6 +47,15 @@ Manifest format (``distribution.yaml`` at the profile root)::
       - skills/
       - cron/
       - mcp.json
+    workspace_requires: worktree   # optional; see below
+
+``workspace_requires`` (optional) declares the workspace kind this profile's
+lane needs in order to run. A coding lane has no filesystem sandbox, so a
+non-git ``scratch`` dir lets the agent roam to whatever real checkout is on the
+machine and edit it uncommitted. Lanes already refuse such a workspace at spawn
+time, but by then the card exists and can only be blocked — declaring the
+requirement here lets ``create_task`` give the card the right workspace up
+front. Omit it (the default) for anything that is happy in a scratch dir.
 
 Update semantics:
 
@@ -78,6 +87,11 @@ from agent.skill_utils import is_excluded_skill_path
 # ---------------------------------------------------------------------------
 
 MANIFEST_FILENAME = "distribution.yaml"
+
+# Workspace kinds a profile may declare via ``workspace_requires``. Mirrors
+# kanban_db.VALID_WORKSPACE_KINDS; kept as a literal here so this module has no
+# import dependency on the kanban layer.
+_VALID_WORKSPACE_REQUIRES = frozenset({"scratch", "worktree", "dir"})
 ENV_TEMPLATE_FILENAME = ".env.template"
 ENV_EXAMPLE_FILENAME = ".env.EXAMPLE"
 
@@ -175,6 +189,14 @@ class DistributionManifest:
     license: str = ""
     env_requires: List[EnvRequirement] = field(default_factory=list)
     distribution_owned: List[str] = field(default_factory=list)
+    # Optional: the workspace kind a profile's lane REQUIRES to run at all.
+    # A code lane that shells out to a coding agent has no filesystem sandbox,
+    # so a non-git scratch dir lets the agent roam to whatever real checkout is
+    # on the machine and edit it uncommitted. Lanes enforce this at spawn time,
+    # but by then the card already exists and can only be refused — declaring it
+    # here lets task creation give the card the right workspace up front.
+    # Empty = no requirement (the default; scratch is fine).
+    workspace_requires: str = ""
     # Tracked after install — where we pulled from, so ``update`` can re-pull.
     source: str = ""
     # ISO-8601 UTC timestamp written on install / update, so ``info`` and
@@ -199,6 +221,12 @@ class DistributionManifest:
         if dist_owned_raw and not isinstance(dist_owned_raw, list):
             raise DistributionError("distribution_owned must be a list")
         distribution_owned = [str(p).strip().strip("/") for p in dist_owned_raw if str(p).strip()]
+        workspace_requires = str(data.get("workspace_requires") or "").strip()
+        if workspace_requires and workspace_requires not in _VALID_WORKSPACE_REQUIRES:
+            raise DistributionError(
+                f"workspace_requires must be one of "
+                f"{sorted(_VALID_WORKSPACE_REQUIRES)}, got {workspace_requires!r}"
+            )
         return cls(
             name=name,
             version=str(data.get("version") or "0.1.0"),
@@ -208,6 +236,7 @@ class DistributionManifest:
             license=str(data.get("license") or ""),
             env_requires=env_requires,
             distribution_owned=distribution_owned,
+            workspace_requires=workspace_requires,
             source=str(data.get("source") or ""),
             installed_at=str(data.get("installed_at") or ""),
         )
@@ -229,6 +258,8 @@ class DistributionManifest:
             out["env_requires"] = [e.to_dict() for e in self.env_requires]
         if self.distribution_owned:
             out["distribution_owned"] = self.distribution_owned
+        if self.workspace_requires:
+            out["workspace_requires"] = self.workspace_requires
         if self.source:
             out["source"] = self.source
         if self.installed_at:
