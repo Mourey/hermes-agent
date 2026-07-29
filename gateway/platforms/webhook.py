@@ -8,7 +8,11 @@ source or to another configured platform.
 Configuration lives in config.yaml under platforms.webhook.extra.routes.
 Each route defines:
   - events: which event types to accept (header-based filtering)
-  - secret: HMAC secret for signature validation (REQUIRED)
+  - secret: HMAC secret for signature validation (REQUIRED). A value of the
+    form ``${VAR}`` is read from the environment (or the active profile's
+    secret scope) at load time, so a tracked config.yaml never has to carry
+    the credential itself. An unset variable resolves to empty, which the
+    "route without a secret is refused" guards then reject.
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
@@ -125,6 +129,60 @@ def _is_loopback_host(host: Optional[str]) -> bool:
     return host.strip().lower() in _LOOPBACK_HOSTS
 
 
+_ENV_REF_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _resolve_secret(value: Any) -> Any:
+    """Expand a whole-string ``${VAR}`` route secret from the environment.
+
+    Route config is frequently a TRACKED file (the ``~/.hermes/config.yaml``
+    symlink points into a git checkout on this deployment), so a literal
+    ``secret:`` means committing a credential. ``secret: "${MY_SECRET}"`` reads
+    the value at load time instead.
+
+    Resolution goes through ``gateway.config._getenv`` so a profile-scoped
+    secret store wins over the process environment when one is installed —
+    the same precedence every other gateway credential read follows.
+
+    Only a value that is ENTIRELY one ``${VAR}`` reference is expanded; a
+    literal secret that merely contains a brace is passed through untouched.
+    An unset variable resolves to ``""``, which the existing "route without a
+    secret is refused" guards then reject (fail closed, never fail open).
+    """
+    if not isinstance(value, str):
+        return value
+    match = _ENV_REF_RE.match(value.strip())
+    if match is None:
+        return value
+    from gateway.config import _getenv
+
+    return _getenv(match.group(1), "") or ""
+
+
+def _normalize_routes(routes: Any) -> Dict[str, dict]:
+    """Return a copy of ``routes`` with every route secret env-resolved.
+
+    Applied once at load for both the static (config.yaml) and dynamic
+    (subscriptions file) route maps, so the startup validation and the
+    per-request signature check both read an already-resolved secret. Copies
+    rather than mutates: ``config.extra["routes"]`` is shared state that other
+    readers (``hermes webhook list``, config round-trips) must still see as
+    the author wrote it.
+    """
+    if not isinstance(routes, dict):
+        return {}
+    normalized: Dict[str, dict] = {}
+    for name, route in routes.items():
+        if not isinstance(route, dict):
+            normalized[name] = route
+            continue
+        if "secret" in route:
+            normalized[name] = {**route, "secret": _resolve_secret(route["secret"])}
+        else:
+            normalized[name] = route
+    return normalized
+
+
 def _hmac_str_equal(provided: str, expected: str) -> bool:
     """Timing-safe equality for two ``str`` values, tolerant of non-ASCII input.
 
@@ -161,8 +219,10 @@ class WebhookAdapter(BasePlatformAdapter):
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = config.extra.get("secret", "")
-        self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
+        self._global_secret: str = _resolve_secret(config.extra.get("secret", ""))
+        self._static_routes: Dict[str, dict] = _normalize_routes(
+            config.extra.get("routes", {})
+        )
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
@@ -453,6 +513,11 @@ class WebhookAdapter(BasePlatformAdapter):
             data = json.loads(subs_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return
+            # Same ``${VAR}`` expansion the static routes get, so the empty-secret
+            # rejection below sees the RESOLVED value: an unset variable must be
+            # refused like any other missing secret, not accepted as the literal
+            # string "${VAR}" and used as an HMAC key.
+            data = _normalize_routes(data)
             # Merge: static routes take precedence over dynamic ones.
             # Reject any dynamic route whose effective secret is empty —
             # an empty secret would cause _handle_webhook to skip HMAC
