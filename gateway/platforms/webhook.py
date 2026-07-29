@@ -21,6 +21,12 @@ Each route defines:
     message that gets delivered.  Use for external push notifications
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
     and sub-second delivery matter more than agent reasoning.
+  - ack_first: if true (and the route has a script), answer 202 as soon as
+    the signature, rate limit and filters pass, then run the script and
+    dispatch in the background.  Required whenever the script can take longer
+    than the sender's timeout — GitHub gives 10s and does not retry, so a
+    slower script silently loses every real delivery while local tests pass.
+    Trade-off: the response can no longer report script-level ignores.
 
 Security:
   - HMAC secret is required per route (validated at startup)
@@ -726,6 +732,103 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # Needed before the script runs so an ack-first route can dedupe BEFORE
+        # it answers (see below).
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+        # ── ack_first: answer the sender, then do the work ──────
+        # A route `script:` otherwise runs to completion before the response is
+        # written, so any script slower than the SENDER's timeout loses the
+        # delivery outright. GitHub allows 10s and does NOT retry, so a script
+        # that takes longer means every real delivery is dropped while local
+        # curl tests pass — the worst possible failure signature, because it
+        # looks like "no events are arriving" rather than like a fault.
+        #
+        # The cost is honest: the response can no longer say whether the script
+        # kept or ignored the event, because that is not known yet, so an
+        # ignored delivery still reads as 202. Everything cheap and decidable —
+        # signature, rate limit, event and filter matching — has already run
+        # above, so a 202 here still means "authentic, subscribed, accepted for
+        # processing".
+        #
+        # Idempotency is recorded BEFORE acking rather than after the script:
+        # once we have promised to handle a delivery, a retry of it must not
+        # start a second run.
+        if route_config.get("ack_first") and route_config.get("script"):
+            if not self._record_delivery_id(delivery_id, time.time()):
+                logger.info(
+                    "[webhook] Skipping duplicate delivery %s", delivery_id
+                )
+                return web.json_response(
+                    {"status": "duplicate", "delivery_id": delivery_id},
+                    status=200,
+                )
+            task = asyncio.create_task(
+                self._script_then_dispatch(
+                    route_name=route_name,
+                    route_config=route_config,
+                    payload=payload,
+                    event_type=event_type,
+                    delivery_id=delivery_id,
+                    profile=profile,
+                    request_method=request.method,
+                    idempotency_recorded=True,
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            logger.info(
+                "[webhook] ack-first accepted event=%s route=%s delivery=%s",
+                event_type,
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
+            )
+
+        return await self._script_then_dispatch(
+            route_name=route_name,
+            route_config=route_config,
+            payload=payload,
+            event_type=event_type,
+            delivery_id=delivery_id,
+            profile=profile,
+            request_method=request.method,
+            idempotency_recorded=False,
+        )
+
+    async def _script_then_dispatch(
+        self,
+        *,
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        event_type: str,
+        delivery_id: str,
+        profile: Any,
+        request_method: str,
+        idempotency_recorded: bool,
+    ) -> "web.Response":
+        """Run the route script, render the prompt, and dispatch the delivery.
+
+        Both response modes share this so they cannot drift: the default path
+        awaits it and returns its response to the sender, while an ``ack_first``
+        route runs it as a background task and discards the response, having
+        already answered 202.
+        """
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
@@ -784,19 +887,12 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
         # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Skip duplicate deliveries (webhook retries).  An ack_first route has
+        # already recorded this delivery before answering — re-recording would
+        # make it look like its own duplicate.
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not idempotency_recorded and not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -901,7 +997,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
-            request.method,
+            request_method,
             event_type,
             route_name,
             len(prompt),
