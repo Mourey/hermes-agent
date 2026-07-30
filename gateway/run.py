@@ -1754,6 +1754,8 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
             if "gateway_timeout_warning" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
+            if "gateway_max_run_seconds" in _agent_cfg:
+                os.environ["HERMES_AGENT_MAX_RUN_SECONDS"] = str(_agent_cfg["gateway_max_run_seconds"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg:
@@ -2506,6 +2508,24 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _walltime_budget_exceeded(
+    started_at: float, budget_seconds: "float | None"
+) -> bool:
+    """True once a run started at ``started_at`` has spent its wall-clock budget.
+
+    Module-level (rather than inlined in the poll loop) so the rule can be
+    tested directly instead of through a copy of the loop. ``budget_seconds``
+    of ``None`` means unlimited, which is the default — the inactivity timeout
+    remains the only ceiling unless an operator opts in.
+
+    Uses the monotonic clock: a wall-clock cap keyed on ``time.time()`` would
+    fire spuriously when the system clock steps (NTP correction, sleep/wake).
+    """
+    if budget_seconds is None:
+        return False
+    return (time.monotonic() - started_at) >= budget_seconds
 
 
 def _platform_config_key(platform: "Platform") -> str:
@@ -21502,12 +21522,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
+            # Wall-clock companion to the inactivity timeout above.  The
+            # inactivity clock never fires on a run that is busy being wrong —
+            # it "can run for hours if it's actively calling tools" — so an
+            # unattended run (webhook-triggered PR review, cron) has no ceiling
+            # at all today.  Config: agent.gateway_max_run_seconds, or
+            # HERMES_AGENT_MAX_RUN_SECONDS (env wins).  Default 0 = unlimited,
+            # so nothing changes for a deployment that does not opt in.
+            _agent_max_run_raw = _float_env("HERMES_AGENT_MAX_RUN_SECONDS", 0)
+            _agent_max_run = _agent_max_run_raw if _agent_max_run_raw > 0 else None
+            _run_started_at = time.monotonic()
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
             )
 
             _inactivity_timeout = False
+            _walltime_timeout = False
             _POLL_INTERVAL = 5.0
+
+            def _walltime_exceeded() -> bool:
+                """True once the run has burned its wall-clock budget."""
+                return _walltime_budget_exceeded(_run_started_at, _agent_max_run)
 
             if _agent_timeout is None:
                 # Unlimited — still poll periodically for backup interrupt
@@ -21519,6 +21554,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if done:
                         response = _executor_task.result()
+                        break
+                    # Wall-clock cap applies even with inactivity unlimited —
+                    # "no inactivity limit" must not mean "no limit at all".
+                    if _walltime_exceeded():
+                        _walltime_timeout = True
                         break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
@@ -21594,6 +21634,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         break
+                    # A busy run never trips the inactivity clock; this is the
+                    # only thing that stops one that is simply taking too long.
+                    if _walltime_exceeded():
+                        _walltime_timeout = True
+                        break
                     # Backup interrupt check (same as unlimited path).
                     if not _interrupt_detected.is_set() and session_key:
                         _backup_adapter = self._adapter_for_source(source)
@@ -21625,7 +21670,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
-            if _inactivity_timeout:
+            if _inactivity_timeout or _walltime_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
                 _activity = {}
@@ -21640,44 +21685,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cur_tool = _activity.get("current_tool")
                 _iter_n = _activity.get("api_call_count", 0)
                 _iter_max = _activity.get("max_iterations", 0)
+                _elapsed_run = time.monotonic() - _run_started_at
 
-                logger.error(
-                    "Agent idle for %.0fs (timeout %.0fs) in session %s "
-                    "| last_activity=%s | iteration=%s/%s | tool=%s",
-                    _secs_ago, _agent_timeout, session_key,
-                    _last_desc, _iter_n, _iter_max,
-                    _cur_tool or "none",
-                )
+                # Two different failures wear the same interrupt: "stuck" and
+                # "too long". Name which one fired — an operator reading the log
+                # must not have to infer it from the numbers.
+                if _walltime_timeout:
+                    logger.error(
+                        "Agent exceeded wall-clock limit: ran %.0fs (max %.0fs) "
+                        "in session %s | last_activity=%s | iteration=%s/%s | tool=%s",
+                        _elapsed_run, _agent_max_run, session_key,
+                        _last_desc, _iter_n, _iter_max,
+                        _cur_tool or "none",
+                    )
+                else:
+                    logger.error(
+                        "Agent idle for %.0fs (timeout %.0fs) in session %s "
+                        "| last_activity=%s | iteration=%s/%s | tool=%s",
+                        _secs_ago, _agent_timeout, session_key,
+                        _last_desc, _iter_n, _iter_max,
+                        _cur_tool or "none",
+                    )
 
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
                     _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
 
-                _timeout_mins = int(_agent_timeout // 60) or 1
-
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
+                if _walltime_timeout:
+                    _limit_mins = int(_agent_max_run // 60) or 1
+                    _diag_lines = [
+                        f"⏱️ Agent stopped after {_limit_mins} min — wall-clock "
+                        f"limit reached (it was still working, not stuck)."
+                    ]
+                else:
+                    _timeout_mins = int(_agent_timeout // 60) or 1
+                    # Construct a user-facing message with diagnostic context.
+                    _diag_lines = [
+                        f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
+                        f"or API responses."
+                    ]
+                if _walltime_timeout:
+                    # Not stuck — it ran out of budget. Report progress, not
+                    # idleness, or the message contradicts itself.
                     _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"Ran for {_elapsed_run:.0f}s, reaching iteration "
+                        f"{_iter_n}/{_iter_max}"
+                        + (f" (in tool `{_cur_tool}`)." if _cur_tool else ".")
+                    )
+                    _diag_lines.append(
+                        "To raise the ceiling, set agent.gateway_max_run_seconds "
+                        "in config.yaml (value in seconds, 0 = no limit) and "
+                        "restart the gateway.\nTry again, or use /reset to start fresh."
                     )
                 else:
+                    if _cur_tool:
+                        _diag_lines.append(
+                            f"The agent appears stuck on tool `{_cur_tool}` "
+                            f"({_secs_ago:.0f}s since last activity, "
+                            f"iteration {_iter_n}/{_iter_max})."
+                        )
+                    else:
+                        _diag_lines.append(
+                            f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
+                            f"iteration {_iter_n}/{_iter_max}). "
+                            "The agent may have been waiting on an API response."
+                        )
                     _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
+                        "To increase the limit, set agent.gateway_timeout in config.yaml "
+                        "(value in seconds, 0 = no limit) and restart the gateway.\n"
+                        "Try again, or use /reset to start fresh."
                     )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
-                )
 
                 response = {
                     "final_response": "\n".join(_diag_lines),

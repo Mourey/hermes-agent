@@ -2511,6 +2511,109 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+# Gateway platforms whose sessions never have a human watching. A webhook
+# delivery is machine-to-machine by construction: nothing is "in the chat" to
+# answer an approval prompt, and a route delivering to `log` has no chat at all.
+_UNATTENDED_PLATFORMS_DEFAULT = ("webhook",)
+
+
+def _get_unattended_approval_mode() -> str:
+    """Read ``approvals.unattended_mode``. Returns 'deny' (default) or 'approve'."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        mode = str(
+            cfg_get(config, "approvals", "unattended_mode", default="deny")
+        ).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "deny"
+    except Exception:
+        return "deny"
+
+
+def _get_unattended_platforms() -> set:
+    """Platforms treated as having no human listener (``approvals.unattended_platforms``)."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        raw = cfg_get(
+            config, "approvals", "unattended_platforms",
+            default=list(_UNATTENDED_PLATFORMS_DEFAULT),
+        )
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple, set)):
+            return set(_UNATTENDED_PLATFORMS_DEFAULT)
+        return {str(p).strip().lower() for p in raw if str(p).strip()}
+    except Exception:
+        return set(_UNATTENDED_PLATFORMS_DEFAULT)
+
+
+def _is_unattended_session() -> bool:
+    """True when this gateway session has nobody who could answer a prompt.
+
+    Cron already has its own answer (``approvals.cron_mode``) and is excluded
+    from the gateway branch entirely — see ``_is_gateway_approval_context``,
+    whose docstring warns that letting cron reach the gateway branch would
+    "submit a pending approval with no listener and block the job
+    indefinitely". A webhook session has exactly the same problem and was never
+    given the same treatment: it takes the gateway branch, finds no notify
+    callback, and leaves a pending approval in a queue nobody will ever read
+    while the agent is told its action is "awaiting approval" forever.
+    """
+    return _get_session_platform().strip().lower() in _get_unattended_platforms()
+
+
+def _unattended_denial(
+    pattern_key: str,
+    description: str,
+    *,
+    status_shape: str = "plain",
+) -> "dict | None":
+    """Deny result for an unattended session, or None to fall through.
+
+    Returns None when a human could plausibly answer (normal gateway session)
+    or when ``approvals.unattended_mode`` is ``approve``. Otherwise returns a
+    definitive refusal in the same shape the cron deny path uses, so the model
+    gets a real answer and adapts instead of waiting on consent that is never
+    coming.
+
+    ``status_shape`` selects the extra keys the calling guard's contract
+    expects: ``"plain"`` for the bare approval gate, ``"command"`` for the
+    shell/code guards, which callers inspect for ``approved``/``status``.
+    """
+    if not _is_unattended_session():
+        return None
+    if _get_unattended_approval_mode() == "approve":
+        return None
+
+    platform = _get_session_platform() or "unknown"
+    logger.warning(
+        "Unattended approval refused (platform=%s, pattern=%s): %s — no human "
+        "is present to consent. Set approvals.unattended_mode=approve to allow, "
+        "or remove the platform from approvals.unattended_platforms.",
+        platform, pattern_key, description,
+    )
+    result = {
+        "approved": False,
+        "pattern_key": pattern_key,
+        "description": description,
+        "user_consent": False,
+        "message": (
+            f"BLOCKED: approval required ({description}) but this is an "
+            f"unattended {platform} session — there is no user to ask, and "
+            f"nobody will approve it later. Do NOT retry it, do NOT rephrase "
+            f"it, and do NOT attempt the same outcome via a different path. "
+            f"Continue with the work you can do without this action, and say "
+            f"in your final answer what you could not do."
+        ),
+    }
+    if status_shape == "command":
+        result["status"] = "denied"
+    return result
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -2745,6 +2848,15 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+        # Unattended gateway sessions (webhook) get a definitive answer here
+        # rather than an interactive round-trip: with a notify callback they
+        # would block for approvals.timeout waiting on a chat nobody reads,
+        # and without one they fall to submit_pending below and leak an
+        # approval that is never resolved.
+        _unattended = _unattended_denial(pattern_key, description)
+        if _unattended is not None:
+            return _unattended
+
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -3423,6 +3535,12 @@ def check_all_command_guards(command: str, env_type: str,
     # input() flow.  The agent never sees "approval_required"; it either
     # gets the command output (approved) or a definitive "BLOCKED" message.
     if is_gateway or is_ask:
+        # Unattended session (webhook): refuse decisively instead of blocking
+        # on a chat with no reader or leaking a pending approval below.
+        _unattended = _unattended_denial(primary_key, combined_desc, status_shape="command")
+        if _unattended is not None:
+            return _unattended
+
         notify_cb = None
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
@@ -3740,6 +3858,12 @@ def check_execute_code_guard(code: str, env_type: str,
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(description)
+
+    # Unattended session (webhook): refuse decisively rather than leaving a
+    # pending approval nobody will resolve.
+    _unattended = _unattended_denial(pattern_key, display_description, status_shape="command")
+    if _unattended is not None:
+        return _unattended
 
     notify_cb = None
     with _lock:

@@ -44,6 +44,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_MAX_ITERATIONS",
             "HERMES_AGENT_TIMEOUT",
             "HERMES_AGENT_TIMEOUT_WARNING",
+            "HERMES_AGENT_MAX_RUN_SECONDS",
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_GATEWAY_BUSY_TEXT_MODE",
             "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
@@ -136,6 +137,29 @@ def test_config_gateway_timeout_wins_over_stale_env(hermes_home: Path) -> None:
 
     assert env.get("HERMES_AGENT_TIMEOUT") == "1800"
     assert env.get("HERMES_AGENT_TIMEOUT_WARNING") == "900"
+
+
+def test_config_max_run_seconds_wins_over_stale_env(hermes_home: Path) -> None:
+    """The wall-clock cap must ride the same config-authoritative bridge.
+
+    It is the only ceiling on a run that is busy rather than stuck, so a stale
+    .env value shadowing it would silently restore "no limit at all".
+    """
+    _write_config(hermes_home, agent_cfg={"gateway_max_run_seconds": 1800})
+    _write_env(hermes_home, {"HERMES_AGENT_MAX_RUN_SECONDS": "60"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_AGENT_MAX_RUN_SECONDS") == "1800"
+
+
+def test_max_run_seconds_absent_when_config_omits_it(hermes_home: Path) -> None:
+    """Default is unlimited: omitting the key must not invent a cap."""
+    _write_config(hermes_home, agent_cfg={"gateway_timeout": 1800})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_AGENT_MAX_RUN_SECONDS") is None
 
 
 def test_config_display_busy_input_mode_wins_over_stale_env(hermes_home: Path) -> None:
