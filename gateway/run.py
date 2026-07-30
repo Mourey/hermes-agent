@@ -2510,22 +2510,11 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     return None
 
 
-def _walltime_budget_exceeded(
-    started_at: float, budget_seconds: "float | None"
-) -> bool:
-    """True once a run started at ``started_at`` has spent its wall-clock budget.
-
-    Module-level (rather than inlined in the poll loop) so the rule can be
-    tested directly instead of through a copy of the loop. ``budget_seconds``
-    of ``None`` means unlimited, which is the default — the inactivity timeout
-    remains the only ceiling unless an operator opts in.
-
-    Uses the monotonic clock: a wall-clock cap keyed on ``time.time()`` would
-    fire spuriously when the system clock steps (NTP correction, sleep/wake).
-    """
-    if budget_seconds is None:
-        return False
-    return (time.monotonic() - started_at) >= budget_seconds
+# The wall-clock rule is shared with the cron watchdog (cron/scheduler.py) —
+# defined in hermes_time so there is one rule, not two copies, and neither
+# subsystem imports the other. Re-exported under the original private name so
+# existing call sites and tests keep working.
+from hermes_time import walltime_budget_exceeded as _walltime_budget_exceeded
 
 
 def _platform_config_key(platform: "Platform") -> str:

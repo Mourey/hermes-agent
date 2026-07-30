@@ -15,6 +15,7 @@ crashes due to a bad timezone string.
 
 import logging
 import os
+import time
 from datetime import datetime
 from hermes_constants import get_config_path
 from typing import Optional
@@ -131,5 +132,29 @@ def now() -> datetime:
         return datetime.now(tz)
     # No timezone configured — use server-local (still tz-aware)
     return datetime.now().astimezone()
+
+
+def walltime_budget_exceeded(
+    started_at: float, budget_seconds: Optional[float]
+) -> bool:
+    """True once a run started at ``started_at`` has spent its wall-clock budget.
+
+    The shared rule behind both run caps — ``agent.gateway_max_run_seconds``
+    (gateway/run.py) and ``cron.max_run_seconds`` (cron/scheduler.py). Both
+    watchdogs are otherwise INACTIVITY timeouts, which by design never fire on a
+    run that is busy being wrong; this is what bounds one that is simply taking
+    too long. It lives here so there is one rule rather than two copies that can
+    drift, and so neither subsystem has to import the other.
+
+    ``budget_seconds`` of ``None`` (or 0, resolved to ``None`` by callers) means
+    unlimited, which is the default: an operator has to opt in.
+
+    ``started_at`` must come from ``time.monotonic()``. A wall-clock cap keyed on
+    ``time.time()`` would fire spuriously whenever the system clock steps — an
+    NTP correction, or a laptop resuming from sleep — and kill a healthy agent.
+    """
+    if budget_seconds is None:
+        return False
+    return (time.monotonic() - started_at) >= budget_seconds
 
 

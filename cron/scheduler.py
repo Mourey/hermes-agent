@@ -43,7 +43,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_time import now as _hermes_now
+from hermes_time import now as _hermes_now, walltime_budget_exceeded
 
 logger = logging.getLogger(__name__)
 
@@ -2052,6 +2052,35 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _resolve_cron_max_run_seconds() -> Optional[float]:
+    """Resolve the cron WALL-CLOCK run cap. ``None`` means unlimited (default).
+
+    Env wins over config, matching ``_get_script_timeout`` above. 0 (or absent,
+    or unparseable) means unlimited — this is opt-in, so a bad value must never
+    silently impose a cap that kills healthy jobs.
+    """
+    raw = os.getenv("HERMES_CRON_MAX_RUN_SECONDS", "").strip()
+    if not raw:
+        try:
+            cfg = load_config() or {}
+            cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+            configured = cron_cfg.get("max_run_seconds")
+            raw = "" if configured is None else str(configured)
+        except Exception as exc:
+            logger.debug("Failed to load cron.max_run_seconds from config: %s", exc)
+            return None
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid cron max run seconds %r; treating as unlimited", raw
+        )
+        return None
+    return value if value > 0 else None
+
+
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     cfg_path = venv_dir / "pyvenv.cfg"
     try:
@@ -3391,7 +3420,25 @@ def run_job(
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+
+        # Wall-clock companion to the inactivity limit above. The inactivity
+        # clock deliberately never fires on a job that is busy — see the comment
+        # above: "the job can run for hours if it's actively calling tools" — so
+        # a job that is busy being WRONG has no ceiling at all without this.
+        # That matters most for the PR-review round, which the webhook now
+        # dispatches through cron: it holds the pipeline's dispatch lease for as
+        # long as it runs.
+        #
+        # cron.max_run_seconds in config.yaml, or HERMES_CRON_MAX_RUN_SECONDS
+        # (env wins). Default 0 = unlimited, so nothing changes for a deployment
+        # that does not opt in. Mirrors agent.gateway_max_run_seconds and shares
+        # its predicate (hermes_time.walltime_budget_exceeded).
+        _cron_max_run = _resolve_cron_max_run_seconds()
+        _run_started_at = time.monotonic()
         _POLL_INTERVAL = 5.0
+
+        def _walltime_exceeded() -> bool:
+            return walltime_budget_exceeded(_run_started_at, _cron_max_run)
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
@@ -3431,11 +3478,13 @@ def run_job(
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
+        _walltime_timeout = False
         try:
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                # Unlimited inactivity — but a one-shot still needs its
+                # run_claim heartbeat, and a wall-clock cap still has to be
+                # enforced, so poll if EITHER applies rather than blocking.
+                if _is_oneshot or _cron_max_run is not None:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
@@ -3445,6 +3494,10 @@ def run_job(
                             result = _cron_future.result()
                             break
                         _heartbeat_run_claim_if_due()
+                        # "No inactivity limit" must not mean "no limit at all".
+                        if _walltime_exceeded():
+                            _walltime_timeout = True
+                            break
                 else:
                     result = _cron_future.result()
             else:
@@ -3468,13 +3521,18 @@ def run_job(
                     if _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
                         break
+                    # A busy job never trips the inactivity clock; this is the
+                    # only thing that stops one that is simply taking too long.
+                    if _walltime_exceeded():
+                        _walltime_timeout = True
+                        break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
-        if _inactivity_timeout:
+        if _inactivity_timeout or _walltime_timeout:
             # Build diagnostic summary from the agent's activity tracker.
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
@@ -3487,16 +3545,38 @@ def run_job(
             _cur_tool = _activity.get("current_tool")
             _iter_n = _activity.get("api_call_count", 0)
             _iter_max = _activity.get("max_iterations", 0)
+            _elapsed_run = time.monotonic() - _run_started_at
 
-            logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
-                _cur_tool or "none",
-            )
+            # Two different failures share one interrupt: "stuck" and "took too
+            # long". Name which fired — an operator must not have to infer it.
+            if _walltime_timeout:
+                logger.error(
+                    "Job '%s' exceeded wall-clock limit: ran %.0fs (max %.0fs) "
+                    "| last_activity=%s | iteration=%s/%s | tool=%s",
+                    job_name, _elapsed_run, _cron_max_run,
+                    _last_desc, _iter_n, _iter_max,
+                    _cur_tool or "none",
+                )
+            else:
+                logger.error(
+                    "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
+                    "| last_activity=%s | iteration=%s/%s | tool=%s",
+                    job_name, _secs_ago, _cron_inactivity_limit,
+                    _last_desc, _iter_n, _iter_max,
+                    _cur_tool or "none",
+                )
             if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
+                agent.interrupt(
+                    "Cron job timed out (wall clock)" if _walltime_timeout
+                    else "Cron job timed out (inactivity)"
+                )
+            if _walltime_timeout:
+                raise TimeoutError(
+                    f"Cron job '{job_name}' ran {int(_elapsed_run)}s, exceeding "
+                    f"the wall-clock limit of {int(_cron_max_run)}s "
+                    f"(it was still working, not stuck) — reached iteration "
+                    f"{_iter_n}/{_iter_max}"
+                )
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
