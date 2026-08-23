@@ -81,6 +81,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "runner": t.runner,
+        "prompt_template": t.prompt_template,
+        "permission_mode": t.permission_mode,
+        "routed_by": t.routed_by,
     }
 
 
@@ -393,6 +397,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--runner", default=None,
+                          choices=sorted(kb.VALID_RUNNERS),
+                          help="Worker runtime the dispatcher spawns "
+                               "(default: hermes). 'kimi' runs the card with "
+                               "the kimi CLI (kimi -p <prompt> "
+                               "--output-format=stream-json) instead of a "
+                               "hermes chat worker.")
+    p_create.add_argument("--prompt", default=None, dest="prompt_template",
+                          metavar="TEMPLATE",
+                          help="Kickoff prompt template. {{task_id}}, "
+                               "{{title}}, {{body}}, {{branch}} and "
+                               "{{workspace_path}} are substituted at spawn. "
+                               "Omit for the runner's default prompt.")
+    p_create.add_argument("--yolo", action="store_true",
+                          help="Record permission_mode=yolo on the card. kimi "
+                               "workers always run auto-approved (print mode "
+                               "implies --afk); on hermes cards the field is "
+                               "informational until a later spec-042 phase.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1562,6 +1584,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Spec 042: execution fields pinned at filing by a human are
+    # operator-pinned — stamp routed_by so later curator routing fills
+    # blanks only instead of overriding the pin.
+    execution_pinned = any(
+        [
+            getattr(args, "runner", None),
+            getattr(args, "prompt_template", None),
+            getattr(args, "yolo", False),
+        ]
+    )
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1585,6 +1617,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            runner=getattr(args, "runner", None),
+            prompt_template=getattr(args, "prompt_template", None),
+            permission_mode="yolo" if getattr(args, "yolo", False) else None,
+            routed_by="operator" if execution_pinned else None,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1762,6 +1798,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    # Spec 042 execution contract. Print the effective runner even when the
+    # column is NULL (NULL → hermes) so the dispatcher's choice is visible
+    # on every card; the other fields only appear when set.
+    _runner = task.runner or "hermes"
+    print(f"  runner:    {_runner}" + ("" if task.runner else " (default)"))
+    if task.permission_mode:
+        print(f"  permission: {task.permission_mode}")
+    if task.prompt_template:
+        print(f"  prompt-template: {task.prompt_template}")
+    if task.routed_by:
+        print(f"  routed-by: {task.routed_by}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

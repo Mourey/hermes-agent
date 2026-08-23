@@ -135,6 +135,18 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Worker runtimes a card can name (spec 042 — dispatch control layer).
+# NULL means ``hermes`` (today's behaviour). The enum widens in later
+# spec-042 phases (claude/pi/omp/acpx); only runners with a spawn leg in
+# ``_default_spawn`` are admitted here.
+VALID_RUNNERS = {"hermes", "kimi"}
+
+# ``permission_mode`` values a card can carry (spec 042). NULL means
+# ``default``. kimi print mode always implies ``--afk`` (all tool calls
+# auto-approved), so for the kimi runner the field is informational; it is
+# stored on the card so routing surfaces stay honest about what will run.
+VALID_PERMISSION_MODES = {"default", "yolo"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1142,6 +1154,16 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Spec 042 execution contract. ``runner`` picks the dispatcher's spawn
+    # leg (None → hermes, today's behaviour); ``prompt_template`` overrides
+    # the kickoff prompt (None → the runner's default template);
+    # ``permission_mode`` records the card's permission contract (kimi print
+    # mode is always effectively yolo via implied --afk); ``routed_by``
+    # stamps who decided the execution fields (operator/curator/None).
+    runner: Optional[str] = None
+    prompt_template: Optional[str] = None
+    permission_mode: Optional[str] = None
+    routed_by: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1257,22 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            runner=(
+                row["runner"] if "runner" in keys and row["runner"] else None
+            ),
+            prompt_template=(
+                row["prompt_template"]
+                if "prompt_template" in keys and row["prompt_template"]
+                else None
+            ),
+            permission_mode=(
+                row["permission_mode"]
+                if "permission_mode" in keys and row["permission_mode"]
+                else None
+            ),
+            routed_by=(
+                row["routed_by"] if "routed_by" in keys and row["routed_by"] else None
             ),
         )
 
@@ -1423,7 +1461,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Spec 042 (dispatch control layer) execution contract. All four are
+    -- NULL on pre-spec cards, and NULL means exactly the pre-spec behaviour:
+    -- hermes worker, literal kickoff prompt, default permissions.
+    -- Worker runtime for the dispatcher's spawn leg (one of VALID_RUNNERS).
+    runner               TEXT,
+    -- Kickoff prompt template ({{task_id}} etc. substituted at spawn).
+    prompt_template      TEXT,
+    -- Permission contract for the worker (one of VALID_PERMISSION_MODES).
+    permission_mode      TEXT,
+    -- Who decided the execution fields ('operator' | 'curator' | NULL).
+    routed_by            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2680,6 +2729,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Spec 042 Phase A execution contract. All four stay NULL on existing
+    # rows, which preserves their exact pre-spec behaviour (hermes runner,
+    # literal kickoff prompt, default permissions).
+    if "runner" not in cols:
+        _add_column_if_missing(conn, "tasks", "runner", "runner TEXT")
+    if "prompt_template" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "prompt_template", "prompt_template TEXT"
+        )
+    if "permission_mode" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "permission_mode", "permission_mode TEXT"
+        )
+    if "routed_by" not in cols:
+        _add_column_if_missing(conn, "tasks", "routed_by", "routed_by TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3230,6 +3295,10 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    runner: Optional[str] = None,
+    prompt_template: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    routed_by: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3274,10 +3343,33 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``runner`` picks the worker runtime the dispatcher spawns (one of
+    ``VALID_RUNNERS``; None → ``hermes``, the pre-spec-042 behaviour).
+    ``prompt_template`` overrides the kickoff prompt (``{{task_id}}`` /
+    ``{{title}}`` / ``{{body}}`` / ``{{branch}}`` / ``{{workspace_path}}``
+    substituted at spawn; None → the runner's default template, which for
+    hermes renders byte-identical to the historical literal).
+    ``permission_mode`` records the card's permission contract (one of
+    ``VALID_PERMISSION_MODES``; None → ``default``). ``routed_by`` stamps
+    who decided the execution fields (``operator`` / ``curator`` / None).
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    runner = (runner or "").strip().lower() or None
+    if runner is not None and runner not in VALID_RUNNERS:
+        raise ValueError(
+            f"runner must be one of {sorted(VALID_RUNNERS)}, got {runner!r}"
+        )
+    permission_mode = (permission_mode or "").strip().lower() or None
+    if permission_mode is not None and permission_mode not in VALID_PERMISSION_MODES:
+        raise ValueError(
+            f"permission_mode must be one of {sorted(VALID_PERMISSION_MODES)}, "
+            f"got {permission_mode!r}"
+        )
+    prompt_template = (prompt_template or "").strip() or None
+    routed_by = (routed_by or "").strip().lower() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3558,8 +3650,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        runner, prompt_template, permission_mode, routed_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3585,6 +3678,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        runner,
+                        prompt_template,
+                        permission_mode,
+                        routed_by,
                     ),
                 )
                 for pid in parents:
@@ -3613,6 +3710,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "runner": runner,
+                        "permission_mode": permission_mode,
+                        "routed_by": routed_by,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -10778,6 +10878,148 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+# ---------------------------------------------------------------------------
+# Worker kickoff prompt templates (spec 042 §4)
+# ---------------------------------------------------------------------------
+
+# Default kickoff for hermes workers. Rendering this through
+# :func:`render_worker_prompt` produces exactly the historical literal
+# ``work kanban task <id>`` — pre-spec cards must not observe any change.
+DEFAULT_HERMES_PROMPT_TEMPLATE = "work kanban task {{task_id}}"
+
+# Default kickoff for kimi workers. kimi workers are plain CLI subprocesses
+# with no hermes toolset, so the template must spell out the whole lifecycle
+# contract the in-process kanban toolset would otherwise carry:
+#   1. read the card via the kanban CLI,
+#   2. do the work in the launch cwd (the dispatcher spawns the worker with
+#      cwd = the card workspace),
+#   3. end with a terminal ``hermes kanban complete`` / ``hermes kanban
+#      block`` call. Those CLI verbs write the same sqlite rows as the
+#      in-process ``kanban_complete`` / ``kanban_block`` tools (both call
+#      ``kb.complete_task`` / ``kb.block_task``), moving the task out of
+#      ``running`` — which is the exact signal ``detect_crashed_workers``
+#      reads to decide a clean exit was NOT a protocol violation.
+DEFAULT_KIMI_PROMPT_TEMPLATE = """\
+You are the worker for kanban task {{task_id}}.
+
+FIRST ACTION — before doing anything else, read your card by running this
+exact command with your shell/Bash tool:
+
+    hermes kanban show {{task_id}} --json
+
+Card title: {{title}}
+
+{{body}}
+
+Do the work the card describes in the directory you were launched in — your
+cwd is the task workspace. Create and edit files there.
+
+MANDATORY TERMINAL ACTION — the run is not finished until you report the
+outcome to the board with your shell/Bash tool:
+
+- On success:
+    hermes kanban complete {{task_id}} --summary "<what you did and where>"
+- On failure:
+    hermes kanban block {{task_id}} --kind <needs_input|capability|transient> "<why you cannot finish>"
+
+A run that ends without one of those two calls is counted as crashed no
+matter what work it did. Never end your turn without making one of them."""
+
+# The kimi CLI takes the prompt as a single argv entry (``-p <prompt>`` —
+# there is no stdin form), so the rendered prompt is bounded by the kernel's
+# per-argument limit (Linux MAX_ARG_STRLEN = 128 KiB; ps exposure is the
+# other cost of argv prompts). Card prompts are a few KB; 100 KiB leaves
+# generous headroom while failing loudly instead of truncating mid-instruction.
+KIMI_PROMPT_ARGV_MAX_BYTES = 100 * 1024
+
+# Env override for the kimi binary location (tests, non-standard installs).
+KIMI_BINARY_PATH_ENV = "HERMES_KANBAN_KIMI_BINARY"
+DEFAULT_KIMI_BINARY = Path.home() / ".kimi-code" / "bin" / "kimi"
+
+
+def task_runner(task: "Task") -> str:
+    """Effective worker runtime for a card. NULL runner → ``hermes``."""
+    return ((task.runner or "").strip().lower()) or "hermes"
+
+
+def render_worker_prompt(task: "Task", workspace: str) -> str:
+    """Render a card's kickoff prompt from its template (spec 042 §4).
+
+    Substitutes ``{{task_id}}``, ``{{title}}``, ``{{body}}``, ``{{branch}}``
+    and ``{{workspace_path}}``. A NULL ``prompt_template`` falls back to the
+    runner's default: ``DEFAULT_KIMI_PROMPT_TEMPLATE`` for kimi cards and
+    ``DEFAULT_HERMES_PROMPT_TEMPLATE`` otherwise — the latter renders
+    byte-identical to the historical ``work kanban task <id>`` literal.
+    """
+    template = task.prompt_template
+    if not template:
+        template = (
+            DEFAULT_KIMI_PROMPT_TEMPLATE
+            if task_runner(task) == "kimi"
+            else DEFAULT_HERMES_PROMPT_TEMPLATE
+        )
+    replacements = {
+        "{{task_id}}": task.id,
+        "{{title}}": task.title or "",
+        "{{body}}": task.body or "",
+        "{{branch}}": task.branch_name or "",
+        "{{workspace_path}}": workspace or "",
+    }
+    prompt = template
+    for placeholder, value in replacements.items():
+        prompt = prompt.replace(placeholder, value)
+    return prompt
+
+
+def _kimi_worker_argv(task: "Task", prompt: str) -> list[str]:
+    """Pre-flight the kimi CLI and build the worker argv (spec 042 §2).
+
+    Raises ``RuntimeError`` on any pre-flight failure — the same exception
+    type the hermes leg raises for a missing ``hermes`` binary, so the
+    dispatcher's ``_record_spawn_failure`` circuit-breaker accounting treats
+    both runners identically.
+    """
+    import subprocess
+
+    binary = Path(
+        os.environ.get(KIMI_BINARY_PATH_ENV, "").strip() or DEFAULT_KIMI_BINARY
+    ).expanduser()
+    if not binary.is_file():
+        raise RuntimeError(
+            f"`kimi` executable not found at {binary}. Install kimi-code or set "
+            f"{KIMI_BINARY_PATH_ENV} before running the kanban dispatcher with "
+            "kimi-runner cards."
+        )
+    try:
+        version = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+            [str(binary), "--version"],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"`kimi --version` failed at {binary}: {exc}") from exc
+    if version.returncode != 0:
+        raise RuntimeError(
+            f"`kimi --version` at {binary} exited with code {version.returncode}"
+        )
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes > KIMI_PROMPT_ARGV_MAX_BYTES:
+        raise RuntimeError(
+            f"rendered kimi prompt is {prompt_bytes} bytes, over the "
+            f"{KIMI_PROMPT_ARGV_MAX_BYTES}-byte argv budget — shorten the "
+            "card's prompt_template."
+        )
+    # kimi print mode implies --afk: every tool call is auto-approved, so no
+    # permission flag is needed (or honoured) — permission_mode on a kimi
+    # card is informational. argv shape mirrors the dynamic-workflows
+    # plugin's kimi runner (runners/kimi.py): -p <prompt>
+    # --output-format=stream-json [--model <m>].
+    cmd = [str(binary), "-p", prompt, "--output-format=stream-json"]
+    if task.model_override:
+        cmd.extend(["--model", task.model_override])
+    return cmd
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10804,7 +11046,7 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = render_worker_prompt(task, workspace)
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -10910,52 +11152,62 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        "--cli",
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
-    # Per-task thinking depth. Independent of the model override — a task can
-    # run the profile's own model at a different depth — so this is its own
-    # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    if task_runner(task) == "kimi":
+        # kimi runner (spec 042 Phase B): spawn the kimi CLI instead of a
+        # hermes chat worker. Everything above — cwd, the HERMES_KANBAN_* env
+        # pins, the per-task log — is deliberately identical to the hermes
+        # leg; only the argv differs. _kimi_worker_argv runs the pre-flight
+        # (binary exists, --version responds, prompt fits the argv budget)
+        # and raises RuntimeError on failure, so a broken kimi install lands
+        # in the same _record_spawn_failure accounting as a missing hermes.
+        cmd = _kimi_worker_argv(task, prompt)
+    else:
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            "--cli",
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+        # Per-task force-loaded skills. Each name goes in its own
+        # `--skills X` pair rather than a single comma-joined arg: the CLI
+        # accepts both forms (action='append' + comma-split), but
+        # per-name pairs are easier to read in `ps` output and avoid any
+        # quoting ambiguity if a skill name ever contains unusual chars.
+        if task.skills:
+            for sk in task.skills:
+                if sk:
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+            # Pin the provider too when the override names one, so the worker
+            # resolves the model against the intended backend instead of the
+            # profile's configured provider (mixing model X with provider Y is
+            # the classic mis-set that stalls a board).
+            if task.provider_override:
+                cmd.extend(["--provider", task.provider_override])
+        # Per-task thinking depth. Independent of the model override — a task can
+        # run the profile's own model at a different depth — so this is its own
+        # branch, not a nested one.
+        if task.reasoning_effort:
+            cmd.extend(["--reasoning", task.reasoning_effort])
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
+        if task.goal_mode:
+            # Goal-mode workers must take the fully-quiet single-query path:
+            # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+            # cli.py's quiet branch. Without -Q the worker gets exactly one
+            # turn, prints text, exits rc=0, and the dispatcher records a
+            # protocol violation (incident 2026-06-09 t_d9cbe312).
+            cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -10981,6 +11233,13 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
+        if task_runner(task) == "kimi":
+            # _kimi_worker_argv pre-flighted the binary, so this is only
+            # reachable if it was deleted in the race window before exec.
+            raise RuntimeError(
+                f"`kimi` executable at {cmd[0]} vanished between pre-flight "
+                "and spawn."
+            )
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
