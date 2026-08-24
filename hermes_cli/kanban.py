@@ -85,6 +85,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "prompt_template": t.prompt_template,
         "permission_mode": t.permission_mode,
         "routed_by": t.routed_by,
+        "swarm_preset": t.swarm_preset,
     }
 
 
@@ -415,6 +416,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "workers always run auto-approved (print mode "
                                "implies --afk); on hermes cards the field is "
                                "informational until a later spec-042 phase.")
+    p_create.add_argument("--swarm", default=None, dest="swarm_preset",
+                          metavar="NAME",
+                          help="Record a swarm preset on the card. Prompt-level "
+                               "instruction only: kimi workers get a '/swarm ' "
+                               "kickoff prefix, omp workers a parallel "
+                               "sub-agents instruction line.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1592,6 +1599,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             getattr(args, "runner", None),
             getattr(args, "prompt_template", None),
             getattr(args, "yolo", False),
+            getattr(args, "swarm_preset", None),
         ]
     )
     with kb.connect_closing() as conn:
@@ -1621,6 +1629,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             prompt_template=getattr(args, "prompt_template", None),
             permission_mode="yolo" if getattr(args, "yolo", False) else None,
             routed_by="operator" if execution_pinned else None,
+            swarm_preset=getattr(args, "swarm_preset", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1809,6 +1818,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  prompt-template: {task.prompt_template}")
     if task.routed_by:
         print(f"  routed-by: {task.routed_by}")
+    if task.swarm_preset:
+        print(f"  swarm:     {task.swarm_preset}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

@@ -136,10 +136,10 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Worker runtimes a card can name (spec 042 — dispatch control layer).
-# NULL means ``hermes`` (today's behaviour). The enum widens in later
-# spec-042 phases (claude/pi/omp/acpx); only runners with a spawn leg in
-# ``_default_spawn`` are admitted here.
-VALID_RUNNERS = {"hermes", "kimi"}
+# NULL means the dispatcher's configured default (``kanban.default_runner``,
+# then ``hermes``). The enum widens in later spec-042 phases (claude/pi/acpx);
+# only runners with a spawn leg in ``_default_spawn`` are admitted here.
+VALID_RUNNERS = {"hermes", "kimi", "omp"}
 
 # ``permission_mode`` values a card can carry (spec 042). NULL means
 # ``default``. kimi print mode always implies ``--afk`` (all tool calls
@@ -1164,6 +1164,10 @@ class Task:
     prompt_template: Optional[str] = None
     permission_mode: Optional[str] = None
     routed_by: Optional[str] = None
+    # Named swarm preset (spec 042 §8). A prompt-level instruction only:
+    # kimi workers get a `/swarm ` kickoff prefix, omp workers a parallel
+    # sub-agents instruction line. None = no swarm.
+    swarm_preset: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1273,6 +1277,11 @@ class Task:
             ),
             routed_by=(
                 row["routed_by"] if "routed_by" in keys and row["routed_by"] else None
+            ),
+            swarm_preset=(
+                row["swarm_preset"]
+                if "swarm_preset" in keys and row["swarm_preset"]
+                else None
             ),
         )
 
@@ -1472,7 +1481,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Permission contract for the worker (one of VALID_PERMISSION_MODES).
     permission_mode      TEXT,
     -- Who decided the execution fields ('operator' | 'curator' | NULL).
-    routed_by            TEXT
+    routed_by            TEXT,
+    -- Named swarm preset (spec 042 §8). A prompt-level instruction, not an
+    -- enforcement mechanism: kimi cards get a `/swarm ` kickoff prefix, omp
+    -- cards a parallel-sub-agents instruction line. NULL = no swarm.
+    swarm_preset         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2744,6 +2757,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
     if "routed_by" not in cols:
         _add_column_if_missing(conn, "tasks", "routed_by", "routed_by TEXT")
+    if "swarm_preset" not in cols:
+        # Named swarm preset (spec 042 Phase D). NULL on existing rows =
+        # no swarm instruction, exactly the behaviour they had.
+        _add_column_if_missing(
+            conn, "tasks", "swarm_preset", "swarm_preset TEXT"
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3299,6 +3318,7 @@ def create_task(
     prompt_template: Optional[str] = None,
     permission_mode: Optional[str] = None,
     routed_by: Optional[str] = None,
+    swarm_preset: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3353,6 +3373,9 @@ def create_task(
     ``permission_mode`` records the card's permission contract (one of
     ``VALID_PERMISSION_MODES``; None → ``default``). ``routed_by`` stamps
     who decided the execution fields (``operator`` / ``curator`` / None).
+    ``swarm_preset`` names a swarm preset (spec 042 §8); it is a
+    prompt-level instruction only (``/swarm `` prefix for kimi, a parallel
+    sub-agents line for omp), never an enforcement mechanism.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3370,6 +3393,7 @@ def create_task(
         )
     prompt_template = (prompt_template or "").strip() or None
     routed_by = (routed_by or "").strip().lower() or None
+    swarm_preset = (swarm_preset or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3651,8 +3675,9 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        runner, prompt_template, permission_mode, routed_by
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        runner, prompt_template, permission_mode, routed_by,
+                        swarm_preset
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3682,6 +3707,7 @@ def create_task(
                         prompt_template,
                         permission_mode,
                         routed_by,
+                        swarm_preset,
                     ),
                 )
                 for pid in parents:
@@ -3713,6 +3739,7 @@ def create_task(
                         "runner": runner,
                         "permission_mode": permission_mode,
                         "routed_by": routed_by,
+                        "swarm_preset": swarm_preset,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -10925,21 +10952,88 @@ outcome to the board with your shell/Bash tool:
 A run that ends without one of those two calls is counted as crashed no
 matter what work it did. Never end your turn without making one of them."""
 
-# The kimi CLI takes the prompt as a single argv entry (``-p <prompt>`` —
-# there is no stdin form), so the rendered prompt is bounded by the kernel's
-# per-argument limit (Linux MAX_ARG_STRLEN = 128 KiB; ps exposure is the
-# other cost of argv prompts). Card prompts are a few KB; 100 KiB leaves
-# generous headroom while failing loudly instead of truncating mid-instruction.
-KIMI_PROMPT_ARGV_MAX_BYTES = 100 * 1024
+# Default kickoff for omp workers — same CLI-bridge doctrine as the kimi
+# template above (omp workers are likewise plain CLI subprocesses with no
+# hermes toolset; the terminal ``hermes kanban complete`` / ``block`` call
+# is what moves the task out of ``running`` before the worker exits).
+DEFAULT_OMP_PROMPT_TEMPLATE = """\
+You are the worker for kanban task {{task_id}}.
+
+FIRST ACTION — before doing anything else, read your card by running this
+exact command with your shell/Bash tool:
+
+    hermes kanban show {{task_id}} --json
+
+Card title: {{title}}
+
+{{body}}
+
+Do the work the card describes in the directory you were launched in — your
+cwd is the task workspace. Create and edit files there.
+
+MANDATORY TERMINAL ACTION — the run is not finished until you report the
+outcome to the board with your shell/Bash tool:
+
+- On success:
+    hermes kanban complete {{task_id}} --summary "<what you did and where>"
+- On failure:
+    hermes kanban block {{task_id}} --kind <needs_input|capability|transient> "<why you cannot finish>"
+
+A run that ends without one of those two calls is counted as crashed no
+matter what work it did. Never end your turn without making one of them."""
+
+# Both the kimi and omp CLIs take the prompt as a single argv entry
+# (``-p <prompt>`` — neither has a stdin form), so the rendered prompt is
+# bounded by the kernel's per-argument limit (Linux MAX_ARG_STRLEN =
+# 128 KiB; ps exposure is the other cost of argv prompts). Card prompts are
+# a few KB; 100 KiB leaves generous headroom while failing loudly instead
+# of truncating mid-instruction.
+WORKER_PROMPT_ARGV_MAX_BYTES = 100 * 1024
 
 # Env override for the kimi binary location (tests, non-standard installs).
 KIMI_BINARY_PATH_ENV = "HERMES_KANBAN_KIMI_BINARY"
 DEFAULT_KIMI_BINARY = Path.home() / ".kimi-code" / "bin" / "kimi"
 
+# omp (@oh-my-pi/pi-coding-agent) is resolved on PATH by default; the env
+# override exists for tests and non-standard installs.
+OMP_BINARY_PATH_ENV = "HERMES_KANBAN_OMP_BINARY"
+# Operator default (2026-08-24 ruling): omp runs kimi-code/k3 with thinking
+# max. A card's own model_override / reasoning_effort always wins over these.
+DEFAULT_OMP_MODEL = "kimi-code/k3"
+DEFAULT_OMP_THINKING = "max"
+
 
 def task_runner(task: "Task") -> str:
-    """Effective worker runtime for a card. NULL runner → ``hermes``."""
-    return ((task.runner or "").strip().lower()) or "hermes"
+    """Effective worker runtime for a card (spec 042).
+
+    Resolution order: the card's own ``runner`` pin, then the dispatcher
+    config's ``kanban.default_runner``, then ``hermes``. The engine default
+    stays hermes; deployments opt into another default via config.
+    """
+    pinned = (task.runner or "").strip().lower()
+    if pinned:
+        return pinned
+    return _configured_default_runner() or "hermes"
+
+
+def _configured_default_runner() -> Optional[str]:
+    """Read ``kanban.default_runner`` from config; None when unset/invalid."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("kanban") or {}).get("default_runner")
+    except Exception:
+        return None
+    value = str(raw or "").strip().lower()
+    if not value:
+        return None
+    if value not in VALID_RUNNERS:
+        _log.warning(
+            "kanban.default_runner %r is not one of %s — falling back to hermes",
+            value, sorted(VALID_RUNNERS),
+        )
+        return None
+    return value
 
 
 def render_worker_prompt(task: "Task", workspace: str) -> str:
@@ -10947,17 +11041,25 @@ def render_worker_prompt(task: "Task", workspace: str) -> str:
 
     Substitutes ``{{task_id}}``, ``{{title}}``, ``{{body}}``, ``{{branch}}``
     and ``{{workspace_path}}``. A NULL ``prompt_template`` falls back to the
-    runner's default: ``DEFAULT_KIMI_PROMPT_TEMPLATE`` for kimi cards and
+    runner's default: ``DEFAULT_KIMI_PROMPT_TEMPLATE`` /
+    ``DEFAULT_OMP_PROMPT_TEMPLATE`` for those runners and
     ``DEFAULT_HERMES_PROMPT_TEMPLATE`` otherwise — the latter renders
     byte-identical to the historical ``work kanban task <id>`` literal.
+
+    A ``swarm_preset`` is a prompt-level instruction (spec 042 §8): kimi
+    cards get a ``/swarm `` prefix (kimi headless swarm is a prompt prefix,
+    not a flag), omp cards a parallel-sub-agents instruction line. hermes
+    cards carry the preset as a recorded field only.
     """
+    runner = task_runner(task)
     template = task.prompt_template
     if not template:
-        template = (
-            DEFAULT_KIMI_PROMPT_TEMPLATE
-            if task_runner(task) == "kimi"
-            else DEFAULT_HERMES_PROMPT_TEMPLATE
-        )
+        if runner == "kimi":
+            template = DEFAULT_KIMI_PROMPT_TEMPLATE
+        elif runner == "omp":
+            template = DEFAULT_OMP_PROMPT_TEMPLATE
+        else:
+            template = DEFAULT_HERMES_PROMPT_TEMPLATE
     replacements = {
         "{{task_id}}": task.id,
         "{{title}}": task.title or "",
@@ -10968,6 +11070,14 @@ def render_worker_prompt(task: "Task", workspace: str) -> str:
     prompt = template
     for placeholder, value in replacements.items():
         prompt = prompt.replace(placeholder, value)
+    if task.swarm_preset:
+        if runner == "kimi":
+            prompt = "/swarm " + prompt
+        elif runner == "omp":
+            prompt = (
+                "Execute with parallel sub-agents "
+                f"(swarm preset: {task.swarm_preset}).\n\n" + prompt
+            )
     return prompt
 
 
@@ -11003,10 +11113,10 @@ def _kimi_worker_argv(task: "Task", prompt: str) -> list[str]:
             f"`kimi --version` at {binary} exited with code {version.returncode}"
         )
     prompt_bytes = len(prompt.encode("utf-8"))
-    if prompt_bytes > KIMI_PROMPT_ARGV_MAX_BYTES:
+    if prompt_bytes > WORKER_PROMPT_ARGV_MAX_BYTES:
         raise RuntimeError(
             f"rendered kimi prompt is {prompt_bytes} bytes, over the "
-            f"{KIMI_PROMPT_ARGV_MAX_BYTES}-byte argv budget — shorten the "
+            f"{WORKER_PROMPT_ARGV_MAX_BYTES}-byte argv budget — shorten the "
             "card's prompt_template."
         )
     # kimi print mode implies --afk: every tool call is auto-approved, so no
@@ -11017,6 +11127,78 @@ def _kimi_worker_argv(task: "Task", prompt: str) -> list[str]:
     cmd = [str(binary), "-p", prompt, "--output-format=stream-json"]
     if task.model_override:
         cmd.extend(["--model", task.model_override])
+    return cmd
+
+
+def _omp_worker_argv(task: "Task", prompt: str) -> list[str]:
+    """Pre-flight the omp CLI and build the worker argv (spec 042 Phase D).
+
+    Raises ``RuntimeError`` on any pre-flight failure — the same exception
+    type the hermes and kimi legs raise, so the dispatcher's
+    ``_record_spawn_failure`` circuit-breaker accounting treats all runners
+    identically.
+    """
+    import shutil
+    import subprocess
+
+    override = os.environ.get(OMP_BINARY_PATH_ENV, "").strip()
+    binary: Optional[Path] = None
+    if override:
+        binary = Path(override).expanduser()
+    else:
+        found = shutil.which("omp")
+        if found:
+            binary = Path(found)
+    if binary is None or not binary.is_file():
+        raise RuntimeError(
+            "`omp` executable not found on PATH. Install "
+            "@oh-my-pi/pi-coding-agent or set "
+            f"{OMP_BINARY_PATH_ENV} before running the kanban dispatcher "
+            "with omp-runner cards."
+        )
+    try:
+        version = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+            [str(binary), "--version"],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"`omp --version` failed at {binary}: {exc}") from exc
+    if version.returncode != 0:
+        raise RuntimeError(
+            f"`omp --version` at {binary} exited with code {version.returncode}"
+        )
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes > WORKER_PROMPT_ARGV_MAX_BYTES:
+        raise RuntimeError(
+            f"rendered omp prompt is {prompt_bytes} bytes, over the "
+            f"{WORKER_PROMPT_ARGV_MAX_BYTES}-byte argv budget — shorten the "
+            "card's prompt_template."
+        )
+    # omp headless auto-approves tool calls — the factory launch-runner.sh
+    # leg runs `omp -p --no-session --max-time <s> <prompt>` with no approval
+    # flag and it executes workflows — so permission_mode on an omp card is
+    # informational, same as kimi's implied --afk. The model defaults to the
+    # operator-pinned kimi-code/k3 (omp shares the kimi CLI's OAuth, so no
+    # API key is needed); a card's model_override always wins.
+    cmd = [
+        str(binary),
+        "-p", prompt,
+        "--no-session",
+        "--model", task.model_override or DEFAULT_OMP_MODEL,
+    ]
+    # Thinking depth (omp --thinking: off|minimal|low|medium|high|xhigh|
+    # max|auto). Operator default is max; a card's reasoning_effort pins
+    # override it, translating the two levels omp lacks ("none" → off,
+    # "ultra" → max, its top level).
+    effort = (task.reasoning_effort or "").strip().lower()
+    if effort:
+        effort = {"none": "off", "ultra": "max"}.get(effort, effort)
+    else:
+        effort = DEFAULT_OMP_THINKING
+    cmd.extend(["--thinking", effort])
+    if task.max_runtime_seconds is not None:
+        cmd.extend(["--max-time", str(int(task.max_runtime_seconds))])
     return cmd
 
 
@@ -11152,7 +11334,8 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    if task_runner(task) == "kimi":
+    runner = task_runner(task)
+    if runner == "kimi":
         # kimi runner (spec 042 Phase B): spawn the kimi CLI instead of a
         # hermes chat worker. Everything above — cwd, the HERMES_KANBAN_* env
         # pins, the per-task log — is deliberately identical to the hermes
@@ -11161,6 +11344,12 @@ def _default_spawn(
         # and raises RuntimeError on failure, so a broken kimi install lands
         # in the same _record_spawn_failure accounting as a missing hermes.
         cmd = _kimi_worker_argv(task, prompt)
+    elif runner == "omp":
+        # omp runner (spec 042 Phase D): spawn the omp CLI (@oh-my-pi/
+        # pi-coding-agent). Same shared contract as the kimi leg — cwd, env
+        # pins, log — with the argv from _omp_worker_argv, whose pre-flight
+        # failures land in the same spawn-failure accounting.
+        cmd = _omp_worker_argv(task, prompt)
     else:
         cmd = [
             *_resolve_hermes_argv(),
@@ -11233,12 +11422,12 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
-        if task_runner(task) == "kimi":
-            # _kimi_worker_argv pre-flighted the binary, so this is only
+        if runner != "hermes":
+            # The non-hermes legs pre-flight their binary, so this is only
             # reachable if it was deleted in the race window before exec.
             raise RuntimeError(
-                f"`kimi` executable at {cmd[0]} vanished between pre-flight "
-                "and spawn."
+                f"`{runner}` executable at {cmd[0]} vanished between "
+                "pre-flight and spawn."
             )
         raise RuntimeError(
             "`hermes` executable not found on PATH. "

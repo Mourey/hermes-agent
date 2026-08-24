@@ -364,7 +364,7 @@ def test_kimi_preflight_prompt_over_argv_budget(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     task = _make_kimi_task(
-        kb, prompt_template="x" * (kb.KIMI_PROMPT_ARGV_MAX_BYTES + 1)
+        kb, prompt_template="x" * (kb.WORKER_PROMPT_ARGV_MAX_BYTES + 1)
     )
     with pytest.raises(RuntimeError, match="argv budget"):
         kb._default_spawn(task, str(workspace))
