@@ -2795,7 +2795,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "paused", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
