@@ -363,6 +363,400 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
 
 
+# ---------------------------------------------------------------------------
+# Budget-paused state (spec 042 §7): runners without a sentinel-exit
+# contract (omp, kimi) report a provider quota wall only in their log — an
+# HTTP 402/403 response whose body carries a billing shape. The reaper
+# recognizes that shape in the dead worker's log tail and parks the card in
+# ``paused`` instead of crash-accounting it: no retry burned
+# (``consecutive_failures`` untouched), no protocol-violation streak tick,
+# and auto-resume to ``ready`` when a later spawn of ANY card on the same
+# provider succeeds.
+# ---------------------------------------------------------------------------
+
+# The two exact billing substrings the implementation must recognize
+# (observed in OpenRouter 402 and kimi 403 bodies).
+_QUOTA_SHAPE_OPENROUTER = "billing, credits, or account entitlement is exhausted"
+_QUOTA_SHAPE_KIMI = "usage limit for this billing cycle"
+
+
+def _quota_log_text(status_code: int, shape: str) -> str:
+    """A realistic dying-worker log tail: HTTP status line plus the
+    provider's JSON error body carrying the billing shape."""
+    reason = {402: "Payment Required", 403: "Forbidden"}[status_code]
+    return (
+        "turn 3 stream ended with provider error\n"
+        f"HTTP/1.1 {status_code} {reason}\n"
+        '{"error": {"message": "' + shape + '", "code": '
+        f"{status_code}" + "}}\n"
+    )
+
+
+def _write_worker_log(tid: str, text: str) -> None:
+    """Write ``tid``'s worker log where the dispatcher really writes it."""
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{tid}.log").write_text(text, encoding="utf-8")
+
+
+def _drive_dead_worker(
+    conn, tid: str, fake_pid: int, raw_status: int, monkeypatch,
+):
+    """Claim ``tid``, record ``raw_status`` for its dead worker pid, and run
+    one reaper pass with liveness patched out. Mirrors the helper in
+    test_kanban_core_functionality.py: one module object for the exit
+    registry, the liveness patch, AND the reaper."""
+    import hermes_cli.kanban_db as _kb
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    claimed = _kb.claim_task(conn, tid, claimer=f"{host}:mock")
+    assert claimed is not None, "task was not claimable for the next attempt"
+    _kb._set_worker_pid(conn, tid, fake_pid)
+    _kb._record_worker_exit(fake_pid, raw_status)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    return _kb.detect_crashed_workers(conn)
+
+
+@pytest.fixture
+def quota_home(kanban_home, monkeypatch):
+    """kanban_home plus instant-reap crash detection (no grace period)."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    return kanban_home
+
+
+def _run_outcomes(conn, tid: str) -> list:
+    return [
+        r["outcome"]
+        for r in conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=?", (tid,)
+        ).fetchall()
+    ]
+
+
+def _events(conn, tid: str, kind: str) -> list:
+    import json
+
+    return [
+        json.loads(r["payload"] or "{}")
+        for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+            (tid, kind),
+        ).fetchall()
+    ]
+
+
+def test_detect_provider_quota_error_recognition():
+    """Pure recognition: both exact billing shapes match alongside a 402 or
+    403 marker; anything else is NOT a quota error."""
+    import hermes_cli.kanban_db as _kb
+
+    for shape in (_QUOTA_SHAPE_OPENROUTER, _QUOTA_SHAPE_KIMI):
+        for code in (402, 403):
+            matched = _kb.detect_provider_quota_error(
+                _quota_log_text(code, shape)
+            )
+            assert matched == shape
+
+    # Case-insensitive: provider casing varies across gateways.
+    assert _kb.detect_provider_quota_error(
+        "HTTP 403 Forbidden: USAGE LIMIT FOR THIS BILLING CYCLE reached"
+    ) == _QUOTA_SHAPE_KIMI
+
+    # Billing shape WITHOUT a 402/403 marker is prose, not a quota wall.
+    for shape in (_QUOTA_SHAPE_OPENROUTER, _QUOTA_SHAPE_KIMI):
+        assert _kb.detect_provider_quota_error(
+            f"worker note: {shape}"
+        ) is None
+
+    # A 402/403 embedded in a larger number (pid, byte count) must NOT
+    # corroborate the shape.
+    assert _kb.detect_provider_quota_error(
+        f"pid 14025 exited; {_QUOTA_SHAPE_OPENROUTER}"
+    ) is None
+    assert _kb.detect_provider_quota_error(
+        f"4030 bytes received; {_QUOTA_SHAPE_KIMI}"
+    ) is None
+
+    # Status markers without a billing shape are ordinary HTTP errors.
+    assert _kb.detect_provider_quota_error(
+        "HTTP/1.1 402 Payment Required\n{\"error\": \"card declined\"}"
+    ) is None
+    assert _kb.detect_provider_quota_error("HTTP 403 Forbidden") is None
+    assert _kb.detect_provider_quota_error(None) is None
+    assert _kb.detect_provider_quota_error("") is None
+
+
+@pytest.mark.parametrize("status_code", (402, 403))
+@pytest.mark.parametrize(
+    "shape", (_QUOTA_SHAPE_OPENROUTER, _QUOTA_SHAPE_KIMI)
+)
+def test_quota_error_pauses_card_without_burning_retry(
+    quota_home, monkeypatch, status_code, shape,
+):
+    """A dead worker whose log tail shows a 402/403 billing shape parks the
+    card in ``paused``: no retry burned, no protocol-violation streak, run
+    closed as ``budget_paused`` (not ``crashed``)."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="quota", assignee="a", provider_override="openrouter", model_override="openrouter/auto",
+        )
+        _write_worker_log(tid, _quota_log_text(status_code, shape))
+
+        crashed = _drive_dead_worker(
+            conn, tid, 71000 + status_code, _exited_status(1), monkeypatch,
+        )
+
+        # NOT a crash: absent from the crashed return and from the
+        # rate-limit side-channel; reported via the budget-paused one.
+        assert tid not in crashed
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_rate_limited", []
+        )
+        assert tid in getattr(
+            _kb.detect_crashed_workers, "_last_budget_paused", []
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "paused"
+        # No retry burned.
+        assert task.consecutive_failures == 0
+        # The pause reason is stamped so the board shows WHY it parked.
+        assert task.last_failure_error and shape in task.last_failure_error
+
+        # Run closed as budget_paused, never as a crash.
+        outcomes = _run_outcomes(conn, tid)
+        assert "budget_paused" in outcomes
+        assert "crashed" not in outcomes
+
+        # The protocol-violation streak is not incremented.
+        assert _kb._protocol_violation_streak(conn, tid) == 0
+
+        # Auditable event carrying the matched shape and provider key.
+        events = _events(conn, tid, "budget_paused")
+        assert len(events) == 1
+        assert events[0]["quota_shape"] == shape
+        assert events[0]["provider"] == "openrouter"
+        assert events[0]["exit_kind"] == "nonzero_exit"
+        assert events[0]["exit_code"] == 1
+
+
+def test_quota_pause_preserves_existing_failure_counter(quota_home, monkeypatch):
+    """A quota pause must leave a non-zero ``consecutive_failures`` exactly
+    as it found it — the pause neither burns nor clears earlier retries."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="quota-after-crash", assignee="a",
+            provider_override="openrouter", model_override="openrouter/auto",
+        )
+
+        # One real crash first: unified counter ticks to 1 (below
+        # DEFAULT_FAILURE_LIMIT — the task requeues to ``ready``).
+        _drive_dead_worker(conn, tid, 72001, _exited_status(1), monkeypatch)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        # Now the provider's wallet runs dry: quota pause must NOT touch
+        # the existing counter in either direction.
+        _write_worker_log(tid, _quota_log_text(402, _QUOTA_SHAPE_OPENROUTER))
+        _drive_dead_worker(conn, tid, 72002, _exited_status(1), monkeypatch)
+        task = kb.get_task(conn, tid)
+        assert task.status == "paused"
+        assert task.consecutive_failures == 1
+
+
+def test_quota_pause_neutral_in_protocol_violation_streak(
+    quota_home, monkeypatch,
+):
+    """A ``budget_paused`` run is skipped by the streak walk: it neither
+    increments nor BREAKS a trailing run of clean-exit violations."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="streak", assignee="a", provider_override="openrouter", model_override="openrouter/auto",
+        )
+
+        # One clean-exit protocol violation (no quota log): streak 1,
+        # below-budget so the unified counter stays untouched.
+        _drive_dead_worker(conn, tid, 73001, _exited_status(0), monkeypatch)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert _kb._protocol_violation_streak(conn, tid) == 1
+
+        # Quota pause in between: the streak must survive intact — the
+        # budget_paused run is neutral, exactly like rate_limited.
+        _write_worker_log(tid, _quota_log_text(403, _QUOTA_SHAPE_KIMI))
+        _drive_dead_worker(conn, tid, 73002, _exited_status(1), monkeypatch)
+        task = kb.get_task(conn, tid)
+        assert task.status == "paused"
+        assert task.consecutive_failures == 0
+        assert _kb._protocol_violation_streak(conn, tid) == 1
+
+
+def test_budget_paused_card_auto_resumes_on_same_provider_success(
+    quota_home, monkeypatch,
+):
+    """A successful spawn of ANY card on the same provider proves the
+    provider is answering again: the paused card returns to ``ready`` with
+    its stale quota stamp cleared (so the respawn guard can't re-park it)
+    and a ``budget_resumed`` audit event."""
+    with kb.connect() as conn:
+        paused_tid = kb.create_task(
+            conn, title="paused-card", assignee="a",
+            provider_override="openrouter", model_override="openrouter/auto",
+        )
+        sibling_tid = kb.create_task(
+            conn, title="same-provider", assignee="a",
+            provider_override="openrouter", model_override="openrouter/auto",
+        )
+
+        _write_worker_log(
+            paused_tid, _quota_log_text(402, _QUOTA_SHAPE_OPENROUTER)
+        )
+        _drive_dead_worker(
+            conn, paused_tid, 74001, _exited_status(1), monkeypatch,
+        )
+        assert kb.get_task(conn, paused_tid).status == "paused"
+
+        # A card on the same provider spawns and completes successfully.
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, sibling_tid, claimer=f"{host}:ok")
+        assert kb.complete_task(conn, sibling_tid, result="done")
+
+        task = kb.get_task(conn, paused_tid)
+        assert task.status == "ready"
+        assert task.last_failure_error is None
+        assert task.consecutive_failures == 0
+
+        events = _events(conn, paused_tid, "budget_resumed")
+        assert len(events) == 1
+        assert events[0]["by_task"] == sibling_tid
+        assert events[0]["provider"] == "openrouter"
+
+
+def test_budget_paused_card_ignores_other_provider_success(
+    quota_home, monkeypatch,
+):
+    """A success on a DIFFERENT provider says nothing about the paused
+    card's provider: the card stays paused and keeps its reason stamp."""
+    with kb.connect() as conn:
+        paused_tid = kb.create_task(
+            conn, title="paused-card", assignee="a",
+            provider_override="openrouter", model_override="openrouter/auto",
+        )
+        other_tid = kb.create_task(
+            conn, title="other-provider", assignee="a",
+            provider_override="anthropic", model_override="anthropic/claude",
+        )
+
+        _write_worker_log(
+            paused_tid, _quota_log_text(403, _QUOTA_SHAPE_KIMI)
+        )
+        _drive_dead_worker(
+            conn, paused_tid, 75001, _exited_status(1), monkeypatch,
+        )
+        assert kb.get_task(conn, paused_tid).status == "paused"
+
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, other_tid, claimer=f"{host}:ok")
+        assert kb.complete_task(conn, other_tid, result="done")
+
+        task = kb.get_task(conn, paused_tid)
+        assert task.status == "paused"
+        assert task.last_failure_error is not None
+        assert _events(conn, paused_tid, "budget_resumed") == []
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    (
+        # Billing shape but NO 402/403 marker → prose, not a quota wall.
+        f"worker note: {_QUOTA_SHAPE_OPENROUTER}",
+        f"retry hint: {_QUOTA_SHAPE_KIMI}",
+        # 402/403 marker but no billing shape → ordinary HTTP error.
+        "HTTP/1.1 402 Payment Required\n{\"error\": \"card declined\"}",
+        "HTTP 403 Forbidden: model not allowed for this key",
+        # Status embedded in a larger number must not corroborate.
+        f"pid 14025 died; {_QUOTA_SHAPE_OPENROUTER}",
+        f"4030 bytes in reply; {_QUOTA_SHAPE_KIMI}",
+        # A 429 throttle is the rate-limit shape, not a billing shape.
+        f"HTTP 429 Too Many Requests: {_QUOTA_SHAPE_KIMI}",
+    ),
+    ids=(
+        "shape-no-status-openrouter",
+        "shape-no-status-kimi",
+        "402-no-shape",
+        "403-no-shape",
+        "status-inside-pid",
+        "status-inside-bytecount",
+        "429-not-quota",
+    ),
+)
+def test_non_quota_crash_uses_normal_crash_accounting(
+    quota_home, monkeypatch, log_text,
+):
+    """Non-quota crashes still go through normal crash accounting: requeue
+    to ``ready``, one failure burned, run closed as ``crashed`` — and the
+    card is NOT parked in ``paused``."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="plain-crash", assignee="a",
+            provider_override="openrouter", model_override="openrouter/auto",
+        )
+        _write_worker_log(tid, log_text)
+
+        crashed = _drive_dead_worker(
+            conn, tid, 76001, _exited_status(1), monkeypatch,
+        )
+
+        assert tid in crashed
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_budget_paused", []
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        outcomes = _run_outcomes(conn, tid)
+        assert "crashed" in outcomes
+        assert "budget_paused" not in outcomes
+        assert _events(conn, tid, "budget_paused") == []
+
+
+def test_crash_without_worker_log_uses_normal_crash_accounting(
+    quota_home, monkeypatch,
+):
+    """No log file at all → nothing to recognize → plain crash accounting
+    (the quota scan must fail open, never park on missing evidence)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="no-log", assignee="a", provider_override="openrouter", model_override="openrouter/auto",
+        )
+
+        crashed = _drive_dead_worker(
+            conn, tid, 77001, _exited_status(1), monkeypatch,
+        )
+
+        assert tid in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        assert _events(conn, tid, "budget_paused") == []
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
