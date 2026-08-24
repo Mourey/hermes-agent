@@ -99,7 +99,11 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+# ``paused`` is the budget-paused state (spec 042 §7): a provider quota
+# error (HTTP 402/403 billing shape) parked the card — no retries burned,
+# no protocol-violation streak — until a same-provider spawn succeeds and
+# auto-resumes it to ``ready``.
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "paused"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -292,6 +296,139 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+
+# ---------------------------------------------------------------------------
+# Budget-paused state (spec 042 §7 — "provider quota errors are not crashes")
+# ---------------------------------------------------------------------------
+#
+# Runners without a sentinel-exit contract (omp, kimi) report a provider
+# quota wall only in their stdout/stderr: an HTTP 402/403 response whose
+# body carries a billing shape. ``detect_crashed_workers`` scans the dead
+# worker's log tail for these shapes and, on a match, parks the card in
+# the ``paused`` status instead of crash-accounting it: no retry is burned
+# (``consecutive_failures`` untouched), the protocol-violation streak is
+# not incremented, and the card auto-resumes to ``ready`` when a later
+# spawn of ANY card on the same provider succeeds.
+
+# Exact billing substrings observed in provider 402/403 bodies
+# (OpenRouter 2026-08-21, kimi 2026-08-23). Matching is case-insensitive
+# substring — the shapes are specific enough that a hit is never prose.
+PROVIDER_QUOTA_BILLING_SHAPES: "tuple[str, ...]" = (
+    "billing, credits, or account entitlement is exhausted",
+    "usage limit for this billing cycle",
+)
+
+# HTTP status corroborator: the quota shape must appear alongside a 402 or
+# 403 marker in the same log tail. Delimited so "402" inside a larger
+# number (pid, byte count, timestamp) doesn't corroborate.
+_PROVIDER_QUOTA_STATUS_RE = re.compile(r"(?:^|[^0-9])(?:402|403)(?:[^0-9]|$)")
+
+# How much of the dead worker's log to scan. The quota error is the last
+# thing a dying worker prints, so a tail window is enough; 64 KiB covers
+# even chatty stream-json final turns.
+_PROVIDER_QUOTA_LOG_TAIL_BYTES = 64 * 1024
+
+
+def detect_provider_quota_error(text: Optional[str]) -> Optional[str]:
+    """Return the matched billing shape when *text* shows a provider quota
+    error — an HTTP 402/403 status marker plus one of
+    ``PROVIDER_QUOTA_BILLING_SHAPES`` — else ``None``.
+
+    Pure function over log text so tests can exercise the recognition
+    without a board on disk.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if not _PROVIDER_QUOTA_STATUS_RE.search(lowered):
+        return None
+    for shape in PROVIDER_QUOTA_BILLING_SHAPES:
+        if shape in lowered:
+            return shape
+    return None
+
+
+def _worker_log_quota_match(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Scan the tail of *task_id*'s worker log for a provider quota error.
+
+    The log directory is derived from the connection's own DB file so the
+    scan works regardless of which board resolution context the caller
+    runs in: non-default boards keep ``logs/`` next to their
+    ``kanban.db``; the default board keeps its DB at ``<root>/kanban.db``
+    but its logs at ``<root>/kanban/logs/``. The first candidate with the
+    task's log file wins; no log file → ``None`` (normal crash
+    accounting).
+    """
+    db_file: Optional[str] = None
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            # Row shape: (seq, name, file); Row supports both index and key.
+            if row[1] == "main":
+                db_file = row[2]
+                break
+    except Exception:
+        return None
+    if not db_file:
+        return None
+    db_parent = Path(db_file).parent
+    for log_dir in (db_parent / "logs", db_parent / "kanban" / "logs"):
+        log_path = log_dir / f"{task_id}.log"
+        try:
+            if not log_path.is_file():
+                continue
+            size = log_path.stat().st_size
+            with open(log_path, "rb") as fh:
+                if size > _PROVIDER_QUOTA_LOG_TAIL_BYTES:
+                    fh.seek(-_PROVIDER_QUOTA_LOG_TAIL_BYTES, os.SEEK_END)
+                tail = fh.read(_PROVIDER_QUOTA_LOG_TAIL_BYTES)
+        except OSError:
+            continue
+        return detect_provider_quota_error(
+            tail.decode("utf-8", errors="replace")
+        )
+    return None
+
+
+def _provider_key_for_fields(
+    runner: Optional[str],
+    provider_override: Optional[str],
+    model_override: Optional[str],
+) -> str:
+    """Stable provider grouping key for budget-pause auto-resume.
+
+    Resolution order: the card's explicit provider pin, then the model's
+    ``provider/model`` prefix (omp cards with no model pin default to
+    ``DEFAULT_OMP_MODEL``), then a ``runner:<runner>`` fallback for cards
+    whose provider only exists inside the worker's own config (e.g. a
+    default hermes profile — the dispatcher can't see that config cheaply,
+    so those cards group per runner).
+
+    The SAME function runs at pause time and at resume time, so cards
+    group consistently even when the provider is only implied. Defined
+    here but resolves the runner default via ``_configured_default_runner``
+    at call time, so config changes between pause and resume don't split a
+    group that shares an explicit pin or model.
+    """
+    provider = (provider_override or "").strip().lower()
+    if provider:
+        return provider
+    effective_runner = (
+        (runner or "").strip().lower()
+        or _configured_default_runner()
+        or "hermes"
+    )
+    model = (model_override or "").strip()
+    if not model and effective_runner == "omp":
+        model = DEFAULT_OMP_MODEL
+    if model:
+        head = model.split("/", 1)[0].strip().lower()
+        return head or model.lower()
+    if effective_runner == "kimi":
+        return "kimi"
+    return f"runner:{effective_runner}"
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -5156,9 +5293,14 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # A successful completion proves this card's provider is answering
+    # again — auto-resume any cards budget-paused on the same provider
+    # back to ``ready`` (spec 042 §7).
+    _done_task = get_task(conn, task_id)
+    if _done_task is not None:
+        _resume_budget_paused_tasks(conn, _done_task)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
-    _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
         task_id,
@@ -5964,15 +6106,18 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked` or `paused` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
     state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    assignee or claim state. For a `paused` (budget-paused) card this is
+    the operator's manual provider-recovery override — the pause reason
+    in ``last_failure_error`` is cleared so the respawn guard can't park
+    the revived card on a stale quota stamp. Returns ``(True, None)`` on
+    success and ``(False, reason)`` if refused. ``dry_run=True`` validates
+    the promotion would succeed without mutating state.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -5981,10 +6126,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "paused"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked' or 'paused'"
         )
 
     if not force:
@@ -6009,8 +6154,10 @@ def promote_task(
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "UPDATE tasks SET status = 'ready', "
+            "last_failure_error = CASE WHEN status = 'paused' THEN NULL "
+            "ELSE last_failure_error END "
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'paused')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -6967,6 +7114,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    budget_paused: list[str] = field(default_factory=list)
+    """Task ids parked in the ``paused`` status this tick because their dead
+    worker's log tail showed a provider quota error (HTTP 402/403 billing
+    shape — spec 042 §7). No failure counted, no protocol-violation streak
+    tick; they auto-resume to ``ready`` when a same-provider spawn
+    succeeds."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -7599,9 +7752,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
-      about the task, exactly as it is neutral for the unified
-      ``consecutive_failures`` counter.
+    * ``rate_limited`` and ``budget_paused`` runs are neutral and skipped:
+      a quota wall says nothing about the task, exactly as it is neutral
+      for the unified ``consecutive_failures`` counter.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
       reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
       protocol violations — mixed failure kinds can neither consume nor
@@ -7621,7 +7774,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "budget_paused"):
             continue
         if outcome == "crashed":
             is_violation = False
@@ -7669,9 +7822,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the dead worker's log tail shows a provider quota error (HTTP
+    402/403 with a billing shape — the only signal available for runners
+    without a sentinel-exit contract, e.g. omp), the task instead parks in
+    the ``paused`` status (spec 042 §7 budget pause): no failure counted,
+    no protocol-violation streak tick, and auto-resume to ``ready`` when a
+    later spawn of any card on the same provider succeeds. The ids are
+    returned via the ``_last_budget_paused`` function attribute.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    budget_paused: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7682,7 +7844,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, "
+            "runner, provider_override, model_override FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7705,7 +7868,36 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            budget_pause_shape: Optional[str] = None
+            if kind in ("clean_exit", "nonzero_exit", "unknown"):
+                # Provider quota wall (spec 042 §7): runners without a
+                # sentinel-exit contract (omp, kimi) surface a 402/403
+                # billing error only in the worker log. Recognize it here,
+                # BEFORE crash / protocol-violation accounting — an empty
+                # wallet is not a task failure and must burn neither a
+                # retry nor the violation streak.
+                budget_pause_shape = _worker_log_quota_match(conn, row["id"])
+            if budget_pause_shape is not None:
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} exited after a provider quota error "
+                    f"(HTTP 402/403: {budget_pause_shape!r}) — card paused "
+                    "until a spawn on the same provider succeeds"
+                )
+                event_kind = "budget_paused"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "quota_shape": budget_pause_shape,
+                    "provider": _provider_key_for_fields(
+                        row["runner"],
+                        row["provider_override"],
+                        row["model_override"],
+                    ),
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -7766,18 +7958,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            # Budget-paused cards park in ``paused`` (not spawnable, not
+            # crash-accounted); every other dead-worker path requeues to
+            # ``ready`` as before.
+            new_status = "paused" if budget_pause_shape is not None else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (new_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited and budget-paused releases are clean releases,
+                # not crashes — record the run outcome accordingly so the
+                # board history doesn't show a phantom crash for a quota wall.
+                _run_outcome = (
+                    "budget_paused"
+                    if budget_pause_shape is not None
+                    else "rate_limited" if rate_limited_exit else "crashed"
+                )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7800,6 +8000,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif budget_pause_shape is not None:
+                    # Budget pause (spec 042 §7): stamp the reason so the
+                    # board UI and the next worker's context can show WHY
+                    # the card parked — but do NOT call
+                    # ``_record_task_failure`` (no retry is burned:
+                    # ``consecutive_failures`` stays untouched) and do NOT
+                    # append to ``crashed`` (the protocol-violation streak
+                    # only walks crashed runs, so it stays untouched too).
+                    # ``_resume_budget_paused_tasks`` clears the stamp on
+                    # auto-resume so the respawn guard can't park the card
+                    # on a stale quota-shaped error.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    budget_paused.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -7909,6 +8125,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # And for budget-paused cards — likewise not failures, but parked in the
+    # ``paused`` status until a same-provider spawn succeeds.
+    detect_crashed_workers._last_budget_paused = budget_paused  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8130,6 +8349,64 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
             "last_failure_error = NULL WHERE id = ?",
             (task_id,),
         )
+
+
+def _resume_budget_paused_tasks(
+    conn: sqlite3.Connection, completed: "Task"
+) -> list[str]:
+    """Auto-resume cards budget-paused on the completing card's provider.
+
+    A successful completion is proof the provider is answering again, so
+    every ``paused`` card whose provider key (``_provider_key_for_fields``)
+    matches the completing card's goes back to ``ready`` (spec 042 §7).
+    The pause reason in ``last_failure_error`` is cleared on resume —
+    otherwise the respawn guard's quota/auth regex would park the revived
+    card forever on a stale stamp. ``consecutive_failures`` is left alone
+    (the pause never touched it). Paused cards were claimed from ``ready``
+    before they parked, so their parents were already satisfied — no
+    parent re-gate here. Returns the resumed task ids.
+    """
+    key = _provider_key_for_fields(
+        completed.runner, completed.provider_override, completed.model_override
+    )
+    resumed: list[str] = []
+    rows = conn.execute(
+        "SELECT id, runner, provider_override, model_override FROM tasks "
+        "WHERE status = 'paused'"
+    ).fetchall()
+    if not rows:
+        return resumed
+    with write_txn(conn):
+        for row in rows:
+            if row["id"] == completed.id:
+                continue
+            if (
+                _provider_key_for_fields(
+                    row["runner"], row["provider_override"], row["model_override"]
+                )
+                != key
+            ):
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', last_failure_error = NULL "
+                "WHERE id = ? AND status = 'paused'",
+                (row["id"],),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "budget_resumed",
+                    {"by_task": completed.id, "provider": key},
+                )
+                resumed.append(row["id"])
+    if resumed:
+        _log.info(
+            "kanban: auto-resumed %d budget-paused task(s) on provider %r "
+            "after %s completed: %s",
+            len(resumed), key, completed.id, ", ".join(resumed),
+        )
+    return resumed
 
 
 # Legacy alias for test-code and anything else that still imports it.
@@ -8466,6 +8743,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Budget-paused cards (provider quota error recognized in the dead
+    # worker's log — spec 042 §7). Parked in ``paused``, no failure
+    # counted; they auto-resume on a same-provider success.
+    _crash_budget_paused = getattr(
+        detect_crashed_workers, "_last_budget_paused", []
+    )
+    if _crash_budget_paused:
+        result.budget_paused.extend(_crash_budget_paused)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
